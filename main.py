@@ -14,7 +14,7 @@ from tiktok_captcha_solver import AsyncPlaywrightSolver
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-05-otp-v6"
+BOT_VERSION = "2026-09-05-otp-v7"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -1954,19 +1954,32 @@ class TikTokChecker:
                     return "captcha"
             # رسائل خطأ
             try:
-                body = (await page.inner_text("body"))[:1500].lower()
+                body = (await page.inner_text("body"))[:1500]
+                body_l = body.lower()
+                if "internal server error" in body_l or (
+                    "try again later" in body_l and "internal" in body_l
+                ):
+                    logger.error(
+                        f"[{email}] تيك توك رفض الدخول: Internal server error "
+                        f"(غالباً البروكسي/IP محظور أو مشبوه)"
+                    )
+                    await self.log_login_state(page, email, "tiktok-ise")
+                    return "server_block"
                 for err in (
                     "incorrect",
                     "wrong password",
                     "couldn't find",
                     "maximum number of attempts",
-                    "try again later",
                     "too many",
                 ):
-                    if err in body:
+                    if err in body_l:
                         logger.error(f"[{email}] خطأ تسجيل دخول ظاهر في الصفحة: {err}")
                         await self.log_login_state(page, email, "login-error")
                         return "error"
+                if "try again later" in body_l:
+                    logger.error(f"[{email}] تيك توك: try again later (حظر مؤقت/بروكسي)")
+                    await self.log_login_state(page, email, "try-again-later")
+                    return "server_block"
             except Exception:
                 pass
             await asyncio.sleep(1)
@@ -2641,47 +2654,72 @@ class TikTokChecker:
                         otp_lock = get_login_otp_lock() if self.config.auto_otp else None
 
                         async def _do_fresh_login() -> bool:
-                            await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
+                            # إحماء جلسة قبل فورم الدخول (يقلل Internal server error أحياناً)
+                            logger.info(f"[{email}] إحماء جلسة TikTok عبر الصفحة الرئيسية...")
+                            await self.safe_goto(page, "https://www.tiktok.com/", email)
+                            await asyncio.sleep(3)
+                            await self.safe_goto(page, "https://www.tiktok.com/login/phone-or-email/email", email)
                             await asyncio.sleep(2)
-
-                            status = await self.submit_email_login(
-                                page, email, password, captcha_solver, attempt=1
-                            )
-                            logger.info(f"[{email}] نتيجة Log in الأولى: {status}")
 
                             email_sent = False
                             otp_after = None
+                            max_login_tries = 4
 
-                            if status == "logged_in":
-                                return True
-                            if status == "captcha":
-                                logger.error(
-                                    f"[{email}] كابتشا تمنع الدخول — أضف مفتاح SadCaptcha في الإعدادات "
-                                    f"أو شغّل headless=false للتجربة"
+                            for attempt in range(1, max_login_tries + 1):
+                                status = await self.submit_email_login(
+                                    page, email, password, captcha_solver, attempt=attempt
                                 )
-                            if status == "verify":
-                                email_sent = await self.click_email_verification_method(page, email)
-                                if email_sent:
-                                    otp_after = time.time() - 1
-                            elif status == "otp":
-                                email_sent = True
-                                otp_after = time.time() - 30
-                            elif status in ("form", "error"):
-                                # محاولة ثانية بعد reload
-                                await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
-                                status2 = await self.submit_email_login(
-                                    page, email, password, captcha_solver, attempt=2
-                                )
-                                logger.info(f"[{email}] نتيجة Log in الثانية: {status2}")
-                                if status2 == "logged_in":
+                                logger.info(f"[{email}] نتيجة Log in #{attempt}: {status}")
+
+                                if status == "logged_in":
                                     return True
-                                if status2 == "verify":
+                                if status == "verify":
                                     email_sent = await self.click_email_verification_method(page, email)
                                     if email_sent:
                                         otp_after = time.time() - 1
-                                elif status2 == "otp":
+                                    break
+                                if status == "otp":
                                     email_sent = True
                                     otp_after = time.time() - 30
+                                    break
+                                if status == "captcha":
+                                    logger.error(
+                                        f"[{email}] كابتشا تمنع الدخول — أضف مفتاح SadCaptcha "
+                                        f"أو عطّل headless للتجربة"
+                                    )
+                                    break
+                                if status == "server_block":
+                                    wait_s = 15 * attempt
+                                    logger.warning(
+                                        f"[{email}] تيك توك Internal server error — "
+                                        f"انتظار {wait_s}ث ثم إعادة المحاولة "
+                                        f"({attempt}/{max_login_tries}). "
+                                        f"غالباً البروكسي الحالي مرفوض لتسجيل الدخول."
+                                    )
+                                    if attempt >= max_login_tries:
+                                        logger.error(
+                                            f"[{email}] فشل الدخول بسبب حظر تيك توك للبروكسي/IP. "
+                                            f"جرّب بروكسي سكني (residential) آخر، أو بدّل الـ IP."
+                                        )
+                                        return False
+                                    try:
+                                        await context.clear_cookies()
+                                    except Exception:
+                                        pass
+                                    await asyncio.sleep(wait_s)
+                                    await self.safe_goto(page, "https://www.tiktok.com/", email)
+                                    await asyncio.sleep(2)
+                                    await self.safe_goto(
+                                        page, "https://www.tiktok.com/login/phone-or-email/email", email
+                                    )
+                                    await asyncio.sleep(2)
+                                    continue
+                                if status in ("form", "error"):
+                                    await asyncio.sleep(5)
+                                    await self.safe_goto(
+                                        page, "https://www.tiktok.com/login/phone-or-email/email", email
+                                    )
+                                    continue
 
                             if await self.is_logged_in(page):
                                 return True
@@ -2689,6 +2727,18 @@ class TikTokChecker:
                                 email_sent = await self.click_email_verification_method(page, email)
                                 if email_sent:
                                     otp_after = time.time() - 1
+
+                            # لا نضيع 180ث إذا ما زال Internal server error على الفورم
+                            try:
+                                body = (await page.inner_text("body"))[:800].lower()
+                                if "internal server error" in body:
+                                    logger.error(
+                                        f"[{email}] ما زال Internal server error — إيقاف هذا الحساب. "
+                                        f"غيّر البروكسي ثم أعد التشغيل."
+                                    )
+                                    return False
+                            except Exception:
+                                pass
 
                             return await self.wait_for_login(
                                 page, email, email_password,
