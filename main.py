@@ -2154,6 +2154,12 @@ async def run_bot(config: Config = None) -> dict:
     if config is None:
         config = Config.from_settings()
 
+    # بروكسي من متغير البيئة إن وُجد (مفيد على VPS)
+    env_proxy = (os.environ.get("TIKTOK_PROXY") or os.environ.get("PROXY") or "").strip()
+    if env_proxy:
+        config.proxy = env_proxy
+        config.proxy_enabled = True
+
     logger.info("=" * 60)
     logger.info("TikTok Comment Bot - التعليق التلقائي على الفيديوهات")
     logger.info("=" * 60)
@@ -2163,6 +2169,14 @@ async def run_bot(config: Config = None) -> dict:
     logger.info(f"💬 تعليقات متبقية في المجمع: {remaining_count()}")
     logger.info(f"👥 أقصى عدد متصفحات متوازية: {config.max_browsers}")
     logger.info(f"📧 OTP تلقائي من Hostinger: {'نعم' if config.auto_otp else 'لا'}")
+    if config.proxy_enabled and config.proxy:
+        parsed = parse_proxy(config.proxy)
+        if parsed:
+            logger.info(f"🛡️ البروكسي: مفعّل → {parsed.get('server')}")
+        else:
+            logger.error("🛡️ البروكسي مفعّل لكن الصيغة خاطئة!")
+    else:
+        logger.warning("🛡️ البروكسي: غير مفعّل — على VPS غالباً راح يحوّلك تيك توك لـ /about")
     logger.info("=" * 60)
 
     if config.bot_mode in ("watch", "watch_comment"):
