@@ -14,7 +14,7 @@ from tiktok_captcha_solver import AsyncPlaywrightSolver
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-05-otp-v4"
+BOT_VERSION = "2026-09-05-otp-v5"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -1793,14 +1793,19 @@ class TikTokChecker:
         return "tiktok.com" in url and "/login" not in url and "verify" not in url
 
     async def has_code_input(self, page: Page) -> bool:
+        """بوب إدخال OTP (بعد اختيار Email) — حقل كود ظاهر."""
         selectors = [
             'input[name="verifyCode"]',
             '.verification-code-input',
             'input[placeholder*="Digit code" i]',
+            'input[placeholder*="6-digit" i]',
+            'input[placeholder*="Enter 6" i]',
             'input[placeholder*="code" i]',
             'input[placeholder*="Code"]',
             'input[maxlength="6"]',
+            'input[maxlength="4"]',
             'input[autocomplete="one-time-code"]',
+            'input[inputmode="numeric"]',
         ]
         for sel in selectors:
             try:
@@ -1809,6 +1814,25 @@ class TikTokChecker:
                     return True
             except Exception:
                 continue
+        # خانات منفصلة
+        try:
+            digits = page.locator('input[maxlength="1"]')
+            if await digits.count() >= 4:
+                if await digits.first.is_visible():
+                    return True
+        except Exception:
+            pass
+        # نص شائع في بوب الكود + زر Next
+        try:
+            body = (await page.inner_text("body"))[:2500]
+            if re.search(r"(enter|type).{0,20}(code|digit)|6-digit|verification code", body, re.I):
+                nxt = page.locator('button:has-text("Next")').first
+                if await nxt.count() > 0 and await nxt.is_visible():
+                    # وتأكد مو صف Email (شاشة الاختيار)
+                    if not re.search(r"Email\s*\n?[a-z0-9*].*@", body, re.I):
+                        return True
+        except Exception:
+            pass
         return False
 
     async def needs_otp(self, page: Page) -> bool:
@@ -1822,86 +1846,159 @@ class TikTokChecker:
         return False
 
     async def has_verify_method_picker(self, page: Page) -> bool:
-        """شاشة Verify it's really you فقط (مو أي Email بالصفحة)."""
+        """بوب 1: Verify + صف Email (قبل شاشة إدخال الكود)."""
+        # إذا ظهر حقل OTP فهذا البوب الثاني — مو picker
+        if await self.has_code_input(page):
+            return False
         try:
             title = page.locator("text=/Verify it.?s really you/i").first
-            if await title.count() > 0 and await title.is_visible():
-                return True
+            has_title = await title.count() > 0 and await title.is_visible()
         except Exception:
-            pass
+            has_title = False
         try:
-            body = (await page.inner_text("body"))[:2000]
-            if "Verify it's really you" in body or "Verify it’s really you" in body:
-                if "Email" in body and ("***" in body or "@" in body):
-                    return True
+            body = (await page.inner_text("body"))[:3000]
+        except Exception:
+            body = ""
+        if not has_title and not re.search(r"Verify it.?s really you", body, re.I):
+            return False
+        # لازم صف Email مع إيميل مخفي
+        if re.search(r"Email", body, re.I) and ("***" in body or "*" in body) and "@" in body:
+            return True
+        try:
+            row = page.locator('div:has-text("Email"):has-text("@")').first
+            if await row.count() > 0 and await row.is_visible():
+                return True
         except Exception:
             pass
         return False
 
     async def click_email_verification_method(self, page: Page, email: str) -> bool:
-        """يضغط خيار Email مرة واحدة لإرسال الرمز."""
+        """بوب 1: يضغط صف Email لإرسال الرسالة والانتقال لبوب OTP."""
+        if await self.has_code_input(page):
+            logger.info(f"[{email}] بوب OTP ظاهر مسبقاً — تخطي ضغط Email")
+            return True
         if not await self.has_verify_method_picker(page):
             return False
 
-        logger.info(f"[{email}] شاشة Verify — الضغط على Email لإرسال الكود...")
+        logger.info(f"[{email}] بوب Verify — الضغط على صف Email لإرسال الكود...")
         domain = (email or "").split("@")[-1] if "@" in (email or "") else ""
+        local = (email or "").split("@")[0] if "@" in (email or "") else ""
+        hint = (local[:1] + "***") if local else "***"
 
-        # اضغط صف Email الذي فيه الإيميل المخفي
-        clicked = await page.evaluate(
-            """(domain) => {
-                const nodes = Array.from(document.querySelectorAll('div,button,li,a,span'));
-                const hit = nodes.find(n => {
-                    const t = (n.innerText || '').replace(/\\s+/g,' ').trim();
-                    if (!t) return false;
-                    const lines = t.split('\\n').map(s => s.trim()).filter(Boolean);
-                    const hasEmailWord = lines.some(l => l === 'Email' || l.startsWith('Email'));
-                    const hasMasked = /@/.test(t) && (/\\*/.test(t) || (domain && t.toLowerCase().includes(domain.toLowerCase())));
-                    return hasEmailWord && hasMasked && t.length < 120;
-                });
-                if (!hit) {
-                    const fallback = nodes.find(n => {
-                        const t = (n.innerText || '').trim();
-                        return t === 'Email' || (t.startsWith('Email') && t.includes('@'));
-                    });
-                    if (!fallback) return false;
-                    (fallback.closest('button,div[role="button"],li,a,div') || fallback).click();
-                    return true;
-                }
-                (hit.closest('button,div[role="button"],li,a,div') || hit).click();
-                return true;
-            }""",
-            domain,
-        )
-        if clicked:
-            await asyncio.sleep(2)
-            # أحياناً بعد اختيار Email يظهر زر Send / Continue / Next لإرسال الرسالة
-            await self._click_send_or_continue(page, email)
-            await asyncio.sleep(2)
-            logger.success(f"[{email}] تم اختيار Email — بانتظار وصول الكود")
+        playwright_clicked = False
+        for sel in [
+            f'div:has-text("Email"):has-text("{domain}"):has-text("*")',
+            f'div:has-text("Email"):has-text("{hint}")',
+            'div[role="button"]:has-text("Email")',
+            'button:has-text("Email")',
+            'li:has-text("Email"):has-text("@")',
+        ]:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() == 0:
+                    continue
+                n = min(await loc.count(), 8)
+                best = None
+                best_len = 10**9
+                for i in range(n):
+                    item = loc.nth(i)
+                    try:
+                        if not await item.is_visible():
+                            continue
+                        txt = (await item.inner_text() or "").strip()
+                        if "Email" not in txt or "@" not in txt:
+                            continue
+                        if len(txt) < best_len and len(txt) < 200:
+                            best = item
+                            best_len = len(txt)
+                    except Exception:
+                        continue
+                if best is not None:
+                    box = await best.bounding_box()
+                    await best.scroll_into_view_if_needed()
+                    if box:
+                        await page.mouse.click(box["x"] + box["width"] * 0.5, box["y"] + box["height"] * 0.5)
+                    else:
+                        await best.click(force=True, timeout=5000)
+                    playwright_clicked = True
+                    logger.info(f"[{email}] نقر على صف Email ({best_len} حرف)")
+                    break
+            except Exception:
+                continue
+
+        clicked = playwright_clicked
+        if not clicked:
+            result = await page.evaluate(
+                """(domain) => {
+                    const isVis = (el) => !!(el && (el.offsetParent || el.getClientRects().length));
+                    const cands = [];
+                    for (const n of document.querySelectorAll('div,button,li,a,span,label')) {
+                        if (!isVis(n)) continue;
+                        const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (!t || t.length > 160) continue;
+                        if (!/\\bEmail\\b/i.test(t)) continue;
+                        if (!t.includes('@')) continue;
+                        if (!(t.includes('*') || t.includes('•'))) continue;
+                        if (domain && !t.toLowerCase().includes(String(domain).toLowerCase())) continue;
+                        cands.push({el: n, len: t.length, t});
+                    }
+                    if (!cands.length) return {ok:false};
+                    cands.sort((a,b) => a.len - b.len);
+                    const hit = cands[0].el;
+                    const target = hit.closest('[role="button"],button,a,li') || hit;
+                    target.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
+                    target.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
+                    target.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
+                    target.click();
+                    return {ok:true, text: cands[0].t.slice(0,80)};
+                }""",
+                domain,
+            )
+            if isinstance(result, dict) and result.get("ok"):
+                logger.info(f"[{email}] نقر JS على: {result.get('text')}")
+                clicked = True
+
+        if not clicked:
+            logger.warning(f"[{email}] لم يجد صف Email في بوب Verify")
+            return False
+
+        # بوب 2: انتظر ظهور حقل OTP + زر Next
+        for i in range(20):
+            await asyncio.sleep(1)
+            if await self.has_code_input(page):
+                logger.success(f"[{email}] ظهر بوب إدخال OTP (حقل الكود + Next)")
+                return True
+            if await self.is_logged_in(page):
+                return True
+            if i == 6 and await self.has_verify_method_picker(page):
+                try:
+                    row = page.locator('div:has-text("Email"):has-text("@")').last
+                    await row.click(force=True)
+                    logger.info(f"[{email}] إعادة نقر صف Email")
+                except Exception:
+                    pass
+
+        logger.warning(f"[{email}] ضغط Email لكن بوب OTP لم يظهر بعد")
+        # نعتبره نجاح جزئي إذا اختفى صف الاختيار
+        if not await self.has_verify_method_picker(page):
+            logger.success(f"[{email}] غادر شاشة Email — بانتظار حقل OTP")
             return True
-
-        logger.warning(f"[{email}] لم يجد خيار Email للضغط")
         return False
 
     async def _click_send_or_continue(self, page: Page, email: str) -> bool:
-        """بعد اختيار Email: اضغط Send code / Continue / Next إن وُجد."""
+        """أزرار إرسال فقط — لا تضغط Next هنا (Next بعد إدخال OTP)."""
         for btn_sel in [
             'button:has-text("Send code")',
             'button:has-text("Send")',
             'button:has-text("Continue")',
-            'button:has-text("Next")',
-            'button:has-text("Resend")',
             'button:has-text("Resend code")',
+            'button:has-text("Resend")',
             'div[role="button"]:has-text("Send code")',
             'div[role="button"]:has-text("Continue")',
-            'div[role="button"]:has-text("Next")',
         ]:
             try:
                 btn = page.locator(btn_sel).first
                 if await btn.count() > 0 and await btn.is_visible():
-                    # لا تضغط Next إذا حقل الكود فاضي — فقط Send/Continue قبل ظهور الحقل
-                    if "Next" in btn_sel and await self.has_code_input(page):
-                        continue
                     await btn.click(force=True)
                     logger.info(f"[{email}] ضغط زر إرسال/متابعة: {btn_sel}")
                     return True
@@ -1929,9 +2026,18 @@ class TikTokChecker:
         return False
 
     async def fill_otp(self, page: Page, code: str, email: str) -> bool:
+        """بوب 2: إدخال OTP ثم الضغط على Next."""
         code = (code or "").strip()
         if not code:
             return False
+
+        logger.info(f"[{email}] بوب OTP — إدخال الرمز ثم Next...")
+
+        # انتظر الحقل إن تأخر ظهور البوب
+        for _ in range(10):
+            if await self.has_code_input(page):
+                break
+            await asyncio.sleep(1)
 
         # حقول منفصلة (رقم لكل خانة)
         try:
@@ -1945,7 +2051,7 @@ class TikTokChecker:
                 await asyncio.sleep(0.5)
                 await self._click_next_after_otp(page, email)
                 mark_otp_used(code)
-                logger.success(f"[{email}] تم إدخال OTP (خانات): {code}")
+                logger.success(f"[{email}] تم إدخال OTP (خانات) + Next: {code}")
                 await asyncio.sleep(3)
                 return True
         except Exception:
@@ -1955,11 +2061,14 @@ class TikTokChecker:
             'input[name="verifyCode"]',
             '.verification-code-input',
             'input[placeholder*="Digit code" i]',
+            'input[placeholder*="6-digit" i]',
+            'input[placeholder*="Enter 6" i]',
             'input[placeholder*="code" i]',
             'input[placeholder*="Code"]',
             'input[maxlength="6"]',
             'input[maxlength="4"]',
             'input[autocomplete="one-time-code"]',
+            'input[inputmode="numeric"]',
             'input[type="tel"]',
         ]
         for sel in selectors:
@@ -1974,11 +2083,29 @@ class TikTokChecker:
                     await loc.fill("")
                 except Exception:
                     pass
-                await loc.type(code, delay=60)
-                await asyncio.sleep(0.6)
+                await loc.type(code, delay=50)
+                await asyncio.sleep(0.5)
+                # تأكيد القيمة لـ React
+                try:
+                    await page.evaluate(
+                        """({sel, code}) => {
+                            const el = document.querySelector(sel);
+                            if (!el) return;
+                            const setter = Object.getOwnPropertyDescriptor(
+                              window.HTMLInputElement.prototype, 'value'
+                            )?.set;
+                            if (setter) setter.call(el, code);
+                            else el.value = code;
+                            el.dispatchEvent(new Event('input', {bubbles:true}));
+                            el.dispatchEvent(new Event('change', {bubbles:true}));
+                        }""",
+                        {"sel": sel, "code": code},
+                    )
+                except Exception:
+                    pass
                 await self._click_next_after_otp(page, email)
                 mark_otp_used(code)
-                logger.success(f"[{email}] تم إدخال OTP تلقائياً: {code}")
+                logger.success(f"[{email}] تم إدخال OTP + Next: {code}")
                 await asyncio.sleep(3)
                 return True
             except Exception:
@@ -1992,15 +2119,21 @@ class TikTokChecker:
                       const m = i.getAttribute('maxlength');
                       const ph = (i.placeholder||'').toLowerCase();
                       const n = (i.name||'').toLowerCase();
-                      return i.offsetParent && (
+                      const vis = !!(i.offsetParent || i.getClientRects().length);
+                      return vis && (
                         n.includes('verify') || n.includes('code') ||
-                        ph.includes('code') || m === '6' || m === '4'
+                        ph.includes('code') || ph.includes('digit') ||
+                        m === '6' || m === '4' || i.getAttribute('inputmode') === 'numeric'
                       );
                     });
                     if (!inputs.length) return false;
                     const el = inputs[0];
                     el.focus();
-                    el.value = code;
+                    const setter = Object.getOwnPropertyDescriptor(
+                      window.HTMLInputElement.prototype, 'value'
+                    )?.set;
+                    if (setter) setter.call(el, code);
+                    else el.value = code;
                     el.dispatchEvent(new Event('input', {bubbles:true}));
                     el.dispatchEvent(new Event('change', {bubbles:true}));
                     return true;
@@ -2010,49 +2143,69 @@ class TikTokChecker:
             if ok:
                 await self._click_next_after_otp(page, email)
                 mark_otp_used(code)
-                logger.success(f"[{email}] تم إدخال OTP عبر JS: {code}")
+                logger.success(f"[{email}] تم إدخال OTP عبر JS + Next: {code}")
                 await asyncio.sleep(3)
                 return True
         except Exception:
             pass
 
-        logger.warning(f"[{email}] وجد OTP لكن تعذر إدخاله في الصفحة")
+        logger.warning(f"[{email}] وجد OTP لكن تعذر إدخاله في بوب الكود")
         return False
 
     async def _click_next_after_otp(self, page: Page, email: str) -> None:
+        """اضغط Next تحت حقل OTP في البوب الثاني."""
+        await asyncio.sleep(0.4)
         clicked_next = False
-        for btn_sel in [
-            'button:has-text("Next")',
-            'button[data-e2e="email-verification-submit"]',
-            'button[type="submit"]',
-            'button:has-text("Verify")',
-            'button:has-text("Continue")',
-            'button:has-text("Submit")',
-            'button:has-text("Confirm")',
-            'div[role="button"]:has-text("Next")',
-        ]:
-            btn = page.locator(btn_sel).first
-            try:
-                if await btn.count() > 0 and await btn.is_visible():
+        for attempt in range(4):
+            for btn_sel in [
+                'button:has-text("Next")',
+                'div[role="button"]:has-text("Next")',
+                'button[data-e2e="email-verification-submit"]',
+                'button[type="submit"]',
+                'button:has-text("Verify")',
+                'button:has-text("Continue")',
+                'button:has-text("Submit")',
+                'button:has-text("Confirm")',
+            ]:
+                btn = page.locator(btn_sel).first
+                try:
+                    if await btn.count() == 0 or not await btn.is_visible():
+                        continue
+                    # انتظر تفعيل الزر إن كان disabled
+                    try:
+                        await btn.wait_for(state="visible", timeout=2000)
+                    except Exception:
+                        pass
+                    disabled = await btn.get_attribute("disabled")
+                    aria = await btn.get_attribute("aria-disabled")
+                    if disabled is not None or aria == "true":
+                        await asyncio.sleep(0.6)
+                        continue
                     await btn.click(force=True)
                     clicked_next = True
                     logger.info(f"[{email}] تم الضغط على Next بعد OTP")
                     break
-            except Exception:
-                continue
-        if not clicked_next:
+                except Exception:
+                    continue
+            if clicked_next:
+                break
+            # لو الزر disabled جرب Enter
             try:
                 await page.keyboard.press("Enter")
-                logger.info(f"[{email}] تم إرسال OTP بـ Enter")
+                logger.info(f"[{email}] محاولة إرسال OTP بـ Enter")
             except Exception:
                 pass
+            await asyncio.sleep(0.8)
+
         await asyncio.sleep(1.5)
-        # لو لسا ظاهر Next جرب مرة ثانية
+        # إعادة Next إن بقي البوب
         try:
-            nxt = page.locator('button:has-text("Next")').first
-            if await nxt.count() > 0 and await nxt.is_visible():
-                await nxt.click(force=True)
-                await asyncio.sleep(2)
+            if await self.has_code_input(page):
+                nxt = page.locator('button:has-text("Next")').first
+                if await nxt.count() > 0 and await nxt.is_visible():
+                    await nxt.click(force=True)
+                    logger.info(f"[{email}] إعادة ضغط Next")
+                    await asyncio.sleep(2)
         except Exception:
             pass
 
