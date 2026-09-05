@@ -237,7 +237,7 @@ def save_settings(data: dict) -> None:
 @dataclass
 class Config:
     """Класс для управления настройками скрипта"""
-    sadcaptcha_api_key: str = "SADCAPCHA_API_KEY"
+    sadcaptcha_api_key: str = ""
 
     # ===== إعدادات الفيديو المستهدف =====
     target_video_url: str = "https://www.tiktok.com/@scaralphaai/video/7680704444190821654"
@@ -1359,7 +1359,11 @@ class TikTokActions:
                 await asyncio.sleep(self.config.action_delay)
                 logger.success(f"Успешно нажали на кнопку Следующее видео для {email}")
                 await self.stats.increment('next_videos')
-                await captcha_solver.solve_captcha_if_present()
+                if captcha_solver:
+                    try:
+                        await captcha_solver.solve_captcha_if_present()
+                    except Exception:
+                        pass
                 await self.update_video_id()  # Обновляем ID видео после перехода
                 return True
             else:
@@ -1371,7 +1375,11 @@ class TikTokActions:
                     logger.success(f"Успешно нажали на кнопку Следующее видео (по CSS классу) для {email}")
                     await self.stats.increment('next_videos')
                     await self.update_video_id()  # Обновляем ID видео после перехода
-                    await captcha_solver.solve_captcha_if_present()
+                    if captcha_solver:
+                        try:
+                            await captcha_solver.solve_captcha_if_present()
+                        except Exception:
+                            pass
 
                     return True
                 else:
@@ -1398,7 +1406,11 @@ class TikTokActions:
                 if await comments_section.count() == 0:
                     comments_button = self.page.locator('span[data-e2e="comment-icon"]').first
                     await comments_button.click()
-                    await captcha_solver.solve_captcha_if_present()
+                    if captcha_solver:
+                        try:
+                            await captcha_solver.solve_captcha_if_present()
+                        except Exception:
+                            pass
                     await asyncio.sleep(self.config.comment_delay)
                     comments_opened = True
                     logger.info(f"Комментарии успешно открыты для {email}")
@@ -1557,6 +1569,18 @@ class TikTokChecker:
         # #endregion
         logger.error(f"[{email}] فشل فتح الفيديو. الصفحة النهائية: {page.url}")
         return False
+
+    async def safe_solve_captcha(self, captcha_solver, email: str) -> None:
+        """يحل الكابتشا إن وُجد مفتاح API صالح؛ لا يوقف البوت عند فشل الخدمة."""
+        if not captcha_solver:
+            return
+        key = (self.config.sadcaptcha_api_key or "").strip()
+        if not key or key in ("SADCAPCHA_API_KEY", "YOUR_API_KEY", "changeme"):
+            return
+        try:
+            await captcha_solver.solve_captcha_if_present()
+        except Exception as e:
+            logger.warning(f"[{email}] تخطي حل الكابتشا: {type(e).__name__}: {e}")
 
     async def is_logged_in(self, page: Page) -> bool:
         """يتحقق إذا المستخدم مسجّل دخول فعلاً."""
@@ -1844,13 +1868,17 @@ class TikTokChecker:
                     stealth = Stealth()
                     await stealth.apply_stealth_async(page)
 
-                    # Инициализация решателя капчи
-                    captcha_solver = AsyncPlaywrightSolver(
-                        page=page,
-                        sadcaptcha_api_key=self.config.sadcaptcha_api_key,
-                        mouse_step_size=2,
-                        mouse_step_delay_ms=5
-                    )
+                    captcha_solver = None
+                    key = (self.config.sadcaptcha_api_key or "").strip()
+                    if key and key not in ("SADCAPCHA_API_KEY", "YOUR_API_KEY", "changeme"):
+                        captcha_solver = AsyncPlaywrightSolver(
+                            page=page,
+                            sadcaptcha_api_key=key,
+                            mouse_step_size=2,
+                            mouse_step_delay_ms=5
+                        )
+                    else:
+                        logger.info(f"[{email}] بدون مفتاح Captcha — سيتم التخطي")
 
                     logged_in = False
                     if os.path.exists(session_file):
@@ -1883,11 +1911,7 @@ class TikTokChecker:
                             await login_button.click()
                             await asyncio.sleep(self.config.action_delay)
 
-                            # Попытка решить капчу
-                            try:
-                                await captcha_solver.solve_captcha_if_present()
-                            except Exception as e:
-                                logger.warning(f"Ошибка решения капчи: {type(e).__name__}: {str(e)}")
+                            await self.safe_solve_captcha(captcha_solver, email)
 
                             await asyncio.sleep(5)
                             # لو ظهرت شاشة اختيار طريقة التحقق — اضغط Email فوراً
@@ -1940,10 +1964,7 @@ class TikTokChecker:
                     if is_profile:
                         logger.info(f"[{email}] رابط بروفايل — فتح الصفحة للحصول على أول فيديو...")
                         await self.safe_goto(page, target, email)
-                        try:
-                            await captcha_solver.solve_captcha_if_present()
-                        except Exception:
-                            pass
+                        await self.safe_solve_captcha(captcha_solver, email)
                         await asyncio.sleep(2)
                         first_video = page.locator('a[href*="/video/"]').first
                         if await first_video.count() > 0:
@@ -1965,11 +1986,7 @@ class TikTokChecker:
                         opened = await self.open_target_video(page, email, target)
                         logger.info(f"[{email}] بعد التحويل: {page.url}")
 
-                    # حل الكابتشا لو ظهرت بعد التنقل
-                    try:
-                        await captcha_solver.solve_captcha_if_present()
-                    except Exception:
-                        pass
+                    await self.safe_solve_captcha(captcha_solver, email)
 
                     # التحقق من أن الصفحة حُمّلت بشكل صحيح
                     if "login" in page.url:
@@ -1996,20 +2013,25 @@ class TikTokChecker:
                         logger.success(f"Успешный вход в аккаунт {email}")
                         await self.stats.increment('successful')
 
+                        await self.safe_solve_captcha(captcha_solver, email)
+                        await asyncio.sleep(self.config.comment_delay)
+
                         try:
-                            await captcha_solver.solve_captcha_if_present()
-                            await asyncio.sleep(self.config.comment_delay)
                             await actions.play_video(email)
-
-                            if self.config.enable_liking:
-                                await actions.like_video(email)
-
-                            if self.config.enable_commenting:
-                                # تعليق واحد مستهلك من المجمع لكل حساب
-                                await actions.post_comment(email)
-
                         except Exception as e:
-                            logger.error(f"Ошибка при выполнении действий для {email}: {type(e).__name__}: {str(e)}")
+                            logger.error(f"[{email}] فشل تشغيل الفيديو: {type(e).__name__}: {e}")
+
+                        if self.config.enable_liking:
+                            try:
+                                await actions.like_video(email)
+                            except Exception as e:
+                                logger.error(f"[{email}] فشل اللايك: {type(e).__name__}: {e}")
+
+                        if self.config.enable_commenting:
+                            try:
+                                await actions.post_comment(email)
+                            except Exception as e:
+                                logger.error(f"[{email}] فشل التعليق: {type(e).__name__}: {e}")
 
                         # Формируем отчет о действиях
                         try:
