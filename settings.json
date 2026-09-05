@@ -14,6 +14,9 @@
   "imap_port": 993,
   "otp_timeout": 90,
   "auto_otp": true,
+  "proxy_enabled": false,
+  "proxy": "",
+  "force_relogin": true,
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5050
 }

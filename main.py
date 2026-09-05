@@ -216,6 +216,7 @@ def load_settings() -> dict:
         "dashboard_port": 5050,
         "proxy_enabled": False,
         "proxy": "",  # host:port:user:pass
+        "force_relogin": True,  # تجاهل الجلسات القديمة وإعادة تسجيل الدخول
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -264,6 +265,7 @@ class Config:
     max_check_attempts: int = 1
     proxy_enabled: bool = False
     proxy: str = ""  # host:port:user:pass
+    force_relogin: bool = True
 
     # Таймауты (в секундах)
     page_timeout: int = 45
@@ -348,6 +350,7 @@ class Config:
         cfg.browser_headless = bool(s.get("browser_headless", False))
         cfg.proxy_enabled = bool(s.get("proxy_enabled", False))
         cfg.proxy = (s.get("proxy") or "").strip()
+        cfg.force_relogin = bool(s.get("force_relogin", True))
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = s.get("imap_host", cfg.imap_host)
         cfg.imap_port = int(s.get("imap_port", 993))
@@ -1857,9 +1860,20 @@ class TikTokChecker:
 
                     session_file = self.file_handler.session_path(email)
                     context_kwargs = dict(self.config.browser_context_options)
-                    if os.path.exists(session_file):
+
+                    use_session = False
+                    if self.config.force_relogin:
+                        if os.path.exists(session_file):
+                            try:
+                                os.remove(session_file)
+                                logger.info(f"[{email}] تم حذف الجلسة القديمة — سيتم تسجيل دخول جديد")
+                            except Exception as e:
+                                logger.warning(f"[{email}] تعذر حذف الجلسة: {e}")
+                    elif os.path.exists(session_file):
                         context_kwargs["storage_state"] = session_file
+                        use_session = True
                         logger.info(f"[{email}] تم تحميل جلسة محفوظة")
+
                     context = await browser.new_context(**context_kwargs)
                     context.set_default_timeout(self.config.page_timeout * 1000)
 
@@ -1881,11 +1895,13 @@ class TikTokChecker:
                         logger.info(f"[{email}] بدون مفتاح Captcha — سيتم التخطي")
 
                     logged_in = False
-                    if os.path.exists(session_file):
+                    if use_session and os.path.exists(session_file):
                         await self.safe_goto(page, 'https://www.tiktok.com', email)
                         logged_in = await self.is_logged_in(page)
                         if logged_in:
                             logger.success(f"[{email}] الجلسة المحفوظة ما زالت صالحة")
+                        else:
+                            logger.warning(f"[{email}] الجلسة منتهية — تسجيل دخول جديد")
 
                     if not logged_in:
                         # Загрузка страницы логина

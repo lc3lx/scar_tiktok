@@ -148,6 +148,7 @@ def api_settings():
         "browser_headless": bool(data.get("browser_headless", True)),
         "proxy_enabled": bool(data.get("proxy_enabled", False)),
         "proxy": (data.get("proxy") or "").strip(),
+        "force_relogin": bool(data.get("force_relogin", True)),
         "auto_otp": bool(data.get("auto_otp", True)),
         "imap_host": (data.get("imap_host") or "imap.hostinger.com").strip(),
         "imap_port": int(data.get("imap_port", 993) or 993),

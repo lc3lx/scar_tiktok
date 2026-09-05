@@ -32,6 +32,7 @@ function settingsPayload() {
     browser_headless: document.getElementById("headless").checked,
     proxy_enabled: document.getElementById("proxyEnabled").checked,
     proxy: document.getElementById("proxy").value.trim(),
+    force_relogin: document.getElementById("forceRelogin").checked,
     watch_count: Number(document.getElementById("watchCount").value || 0),
     max_browsers: Number(document.getElementById("maxBrowsers").value || 1),
     otp_timeout: Number(document.getElementById("otpTimeout").value || 90),
@@ -58,6 +59,7 @@ function fillSettings(s, comments) {
   document.getElementById("headless").checked = s.browser_headless !== false;
   document.getElementById("proxyEnabled").checked = !!s.proxy_enabled;
   document.getElementById("proxy").value = s.proxy || "";
+  document.getElementById("forceRelogin").checked = s.force_relogin !== false;
   document.getElementById("watchCount").value = s.watch_count ?? 0;
   document.getElementById("maxBrowsers").value = s.max_browsers || 1;
   document.getElementById("otpTimeout").value = s.otp_timeout || 90;
