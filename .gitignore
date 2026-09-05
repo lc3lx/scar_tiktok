@@ -1,6 +1,7 @@
 # Secrets & local data
 accounts.json
 mailboxes.json
+settings.json
 acc.txt
 accounts/
 *.session.json

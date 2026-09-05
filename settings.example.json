@@ -16,7 +16,7 @@
   "auto_otp": true,
   "proxy_enabled": false,
   "proxy": "",
-  "force_relogin": true,
+  "force_relogin": false,
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5050
 }
