@@ -2037,7 +2037,6 @@ async def run_bot(config: Config = None) -> dict:
     await processor.process_all()
     report = await processor.stats.get_report()
     await _close_all_browsers()
-    global _BOT_LOOP
     _BOT_LOOP = None
     return {"ok": True, "report": report, "stats": processor.stats.counters, "stopped": should_stop()}
 
