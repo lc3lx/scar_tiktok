@@ -14,7 +14,7 @@ from tiktok_captcha_solver import AsyncPlaywrightSolver
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-05-otp-v7"
+BOT_VERSION = "2026-09-05-otp-v8"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -2093,7 +2093,7 @@ class TikTokChecker:
         return False
 
     async def click_email_verification_method(self, page: Page, email: str) -> bool:
-        """بوب 1: يضغط صف Email لإرسال الرسالة والانتقال لبوب OTP."""
+        """بوب 1: يضغط صف Email تحديداً (مش وسط المودال) لإرسال الكود لـ Hostinger."""
         if await self.has_code_input(page):
             logger.info(f"[{email}] بوب OTP ظاهر مسبقاً — تخطي ضغط Email")
             return True
@@ -2102,108 +2102,226 @@ class TikTokChecker:
 
         logger.info(f"[{email}] بوب Verify — الضغط على صف Email لإرسال الكود...")
         domain = (email or "").split("@")[-1] if "@" in (email or "") else ""
-        local = (email or "").split("@")[0] if "@" in (email or "") else ""
-        hint = (local[:1] + "***") if local else "***"
 
-        playwright_clicked = False
-        for sel in [
-            f'div:has-text("Email"):has-text("{domain}"):has-text("*")',
-            f'div:has-text("Email"):has-text("{hint}")',
-            'div[role="button"]:has-text("Email")',
-            'button:has-text("Email")',
-            'li:has-text("Email"):has-text("@")',
-        ]:
-            try:
-                loc = page.locator(sel)
-                if await loc.count() == 0:
-                    continue
-                n = min(await loc.count(), 8)
-                best = None
-                best_len = 10**9
-                for i in range(n):
-                    item = loc.nth(i)
-                    try:
-                        if not await item.is_visible():
-                            continue
-                        txt = (await item.inner_text() or "").strip()
-                        if "Email" not in txt or "@" not in txt:
-                            continue
-                        if len(txt) < best_len and len(txt) < 200:
-                            best = item
-                            best_len = len(txt)
-                    except Exception:
-                        continue
-                if best is not None:
-                    box = await best.bounding_box()
-                    await best.scroll_into_view_if_needed()
-                    if box:
-                        await page.mouse.click(box["x"] + box["width"] * 0.5, box["y"] + box["height"] * 0.5)
-                    else:
-                        await best.click(force=True, timeout=5000)
-                    playwright_clicked = True
-                    logger.info(f"[{email}] نقر على صف Email ({best_len} حرف)")
-                    break
-            except Exception:
-                continue
+        async def _row_looks_right(txt: str) -> bool:
+            t = (txt or "").strip()
+            if not t or "@" not in t:
+                return False
+            if not re.search(r"\bEmail\b", t, re.I):
+                return False
+            if "*" not in t and "•" not in t:
+                return False
+            # ارفض المودال الكامل (فيه عنوان Verify + methods)
+            if re.search(r"Verify it.?s really you", t, re.I):
+                return False
+            if "methods" in t.lower() and "before you continue" in t.lower():
+                return False
+            if domain and domain.lower() not in t.lower():
+                return False
+            if len(t) > 100:
+                return False
+            return True
 
-        clicked = playwright_clicked
-        if not clicked:
+        clicked = False
+        click_info = None
+
+        # 1) JS: صف بحجم زر حقيقي (ارتفاع ~40-100) يحتوي Email + إيميل مخفي فقط
+        try:
             result = await page.evaluate(
                 """(domain) => {
-                    const isVis = (el) => !!(el && (el.offsetParent || el.getClientRects().length));
+                    const isVis = (el) => {
+                      const r = el.getBoundingClientRect();
+                      return r.width > 0 && r.height > 0 && r.bottom > 0 && r.top < innerHeight;
+                    };
                     const cands = [];
-                    for (const n of document.querySelectorAll('div,button,li,a,span,label')) {
-                        if (!isVis(n)) continue;
-                        const t = (n.innerText || '').replace(/\\s+/g, ' ').trim();
-                        if (!t || t.length > 160) continue;
+                    for (const el of document.querySelectorAll('div,button,li,a,label,span')) {
+                        if (!isVis(el)) continue;
+                        const t = (el.innerText || '').replace(/\\s+/g, ' ').trim();
+                        if (!t || t.length > 90) continue;
                         if (!/\\bEmail\\b/i.test(t)) continue;
                         if (!t.includes('@')) continue;
                         if (!(t.includes('*') || t.includes('•'))) continue;
+                        if (/Verify it.?s really you/i.test(t)) continue;
+                        if (/before you continue/i.test(t)) continue;
                         if (domain && !t.toLowerCase().includes(String(domain).toLowerCase())) continue;
-                        cands.push({el: n, len: t.length, t});
+                        const r = el.getBoundingClientRect();
+                        // صف الاختيار عادة عرض كبير وارتفاع متوسط
+                        if (r.width < 180 || r.height < 36 || r.height > 110) continue;
+                        cands.push({
+                          el,
+                          area: r.width * r.height,
+                          h: Math.round(r.height),
+                          w: Math.round(r.width),
+                          x: r.x + r.width/2,
+                          y: r.y + r.height/2,
+                          t: t.slice(0, 80),
+                        });
                     }
-                    if (!cands.length) return {ok:false};
-                    cands.sort((a,b) => a.len - b.len);
-                    const hit = cands[0].el;
-                    const target = hit.closest('[role="button"],button,a,li') || hit;
-                    target.dispatchEvent(new MouseEvent('mousedown', {bubbles:true, cancelable:true}));
-                    target.dispatchEvent(new MouseEvent('mouseup', {bubbles:true, cancelable:true}));
-                    target.dispatchEvent(new MouseEvent('click', {bubbles:true, cancelable:true}));
-                    target.click();
-                    return {ok:true, text: cands[0].t.slice(0,80)};
+                    if (!cands.length) return {ok:false, reason:'no-row'};
+                    // أصغر صف مطابق (الديف الداخلي للصف)
+                    cands.sort((a,b) => a.area - b.area);
+                    const hit = cands[0];
+                    const target = hit.el.closest('[role="button"],button,a,li') || hit.el;
+                    const r2 = target.getBoundingClientRect();
+                    const cx = r2.x + r2.width/2;
+                    const cy = r2.y + r2.height/2;
+                    // pointer events حقيقية
+                    for (const type of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+                      target.dispatchEvent(new MouseEvent(type, {
+                        bubbles: true, cancelable: true, view: window,
+                        clientX: cx, clientY: cy, buttons: 1
+                      }));
+                    }
+                    try { target.click(); } catch(e) {}
+                    return {ok:true, text: hit.t, w: hit.w, h: hit.h, x: cx, y: cy, n: cands.length};
                 }""",
                 domain,
             )
             if isinstance(result, dict) and result.get("ok"):
-                logger.info(f"[{email}] نقر JS على: {result.get('text')}")
                 clicked = True
+                click_info = result
+                logger.info(
+                    f"[{email}] نقر صف Email JS: '{result.get('text')}' "
+                    f"size={result.get('w')}x{result.get('h')} candidates={result.get('n')}"
+                )
+                # تأكيد بنقرة إحداثيات Playwright أيضاً
+                try:
+                    x, y = float(result["x"]), float(result["y"])
+                    await page.mouse.click(x, y)
+                except Exception:
+                    pass
+            else:
+                logger.warning(f"[{email}] JS لم يجد صف Email: {result}")
+        except Exception as e:
+            logger.warning(f"[{email}] JS Email click error: {e}")
+
+        # 2) Playwright: نص الإيميل المخفي نفسه
+        if not clicked:
+            try:
+                loc = page.get_by_text(re.compile(rf"[a-z0-9*]+@{re.escape(domain)}", re.I))
+                n = await loc.count()
+                for i in range(min(n, 5)):
+                    item = loc.nth(i)
+                    if not await item.is_visible():
+                        continue
+                    # اضغط الأب القريب بحجم صف
+                    handle = await item.evaluate_handle(
+                        """el => {
+                            let p = el;
+                            for (let i=0;i<6 && p;i++) {
+                              const r = p.getBoundingClientRect();
+                              const t = (p.innerText||'').trim();
+                              if (r.height>=36 && r.height<=110 && r.width>=180 && /Email/i.test(t) && t.includes('@'))
+                                return p;
+                              p = p.parentElement;
+                            }
+                            return el.parentElement || el;
+                        }"""
+                    )
+                    el = handle.as_element()
+                    if el:
+                        box = await el.bounding_box()
+                        if box:
+                            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                            clicked = True
+                            click_info = {"via": "masked-text", "box": box}
+                            logger.info(f"[{email}] نقر عبر نص الإيميل المخفي @{domain}")
+                            break
+            except Exception as e:
+                logger.warning(f"[{email}] masked-text click: {e}")
+
+        # 3) Playwright locators ضيقة
+        if not clicked:
+            for sel in [
+                f'div[role="button"]:has-text("Email"):has-text("{domain}")',
+                f'button:has-text("Email"):has-text("{domain}")',
+                f'li:has-text("Email"):has-text("{domain}")',
+            ]:
+                try:
+                    loc = page.locator(sel)
+                    count = await loc.count()
+                    for i in range(min(count, 6)):
+                        item = loc.nth(i)
+                        if not await item.is_visible():
+                            continue
+                        txt = (await item.inner_text() or "").strip()
+                        if not await _row_looks_right(txt):
+                            continue
+                        box = await item.bounding_box()
+                        if box and (box["height"] < 36 or box["height"] > 110):
+                            continue
+                        if box:
+                            await page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                        else:
+                            await item.click(force=True)
+                        clicked = True
+                        logger.info(f"[{email}] نقر Playwright: {txt[:60]}")
+                        break
+                    if clicked:
+                        break
+                except Exception:
+                    continue
 
         if not clicked:
-            logger.warning(f"[{email}] لم يجد صف Email في بوب Verify")
+            # dump للمساعدة
+            try:
+                dump = await page.evaluate(
+                    """() => Array.from(document.querySelectorAll('div,button,li')).slice(0,80).map(el => {
+                      const t=(el.innerText||'').replace(/\\s+/g,' ').trim();
+                      if (!/email/i.test(t) || !t.includes('@')) return null;
+                      const r=el.getBoundingClientRect();
+                      return {t:t.slice(0,100), w:Math.round(r.width), h:Math.round(r.height)};
+                    }).filter(Boolean).slice(0,15)"""
+                )
+                logger.warning(f"[{email}] لم يجد صف Email القابل للنقر | dump={dump}")
+                # #region agent log
+                _dbg("EMAIL_ROW", "main.py:click_email", "not_found", {"email": email, "dump": dump}, run_id="pre-fix")
+                # #endregion
+            except Exception:
+                logger.warning(f"[{email}] لم يجد صف Email في بوب Verify")
             return False
 
-        # بوب 2: انتظر ظهور حقل OTP + زر Next
-        for i in range(20):
+        # #region agent log
+        _dbg("EMAIL_ROW", "main.py:click_email", "clicked", {"email": email, "info": click_info}, run_id="pre-fix")
+        # #endregion
+
+        # بوب 2: انتظر ظهور حقل OTP + زر Next (هذا يعني أن الرسالة انبعثت)
+        for i in range(25):
             await asyncio.sleep(1)
             if await self.has_code_input(page):
-                logger.success(f"[{email}] ظهر بوب إدخال OTP (حقل الكود + Next)")
+                logger.success(f"[{email}] ظهر بوب إدخال OTP بعد ضغط Email — الكود يُفترض أُرسل لـ Hostinger")
                 return True
             if await self.is_logged_in(page):
                 return True
-            if i == 6 and await self.has_verify_method_picker(page):
+            # إعادة نقر إذا بقي الـ picker
+            if i in (4, 10, 16) and await self.has_verify_method_picker(page):
+                logger.info(f"[{email}] إعادة محاولة ضغط صف Email (#{i})...")
                 try:
-                    row = page.locator('div:has-text("Email"):has-text("@")').last
-                    await row.click(force=True)
-                    logger.info(f"[{email}] إعادة نقر صف Email")
+                    await page.evaluate(
+                        """(domain) => {
+                            const nodes = Array.from(document.querySelectorAll('div,button,li'));
+                            const hit = nodes.find(el => {
+                              const t=(el.innerText||'').replace(/\\s+/g,' ').trim();
+                              const r=el.getBoundingClientRect();
+                              return /\\bEmail\\b/i.test(t) && t.includes('@') && t.includes('*')
+                                && !/Verify it/i.test(t) && r.height>=36 && r.height<=110 && r.width>=180
+                                && (!domain || t.toLowerCase().includes(domain.toLowerCase()));
+                            });
+                            if (hit) { hit.click(); return true; }
+                            return false;
+                        }""",
+                        domain,
+                    )
                 except Exception:
                     pass
 
-        logger.warning(f"[{email}] ضغط Email لكن بوب OTP لم يظهر بعد")
-        # نعتبره نجاح جزئي إذا اختفى صف الاختيار
-        if not await self.has_verify_method_picker(page):
-            logger.success(f"[{email}] غادر شاشة Email — بانتظار حقل OTP")
-            return True
-        return False
+        still_picker = await self.has_verify_method_picker(page)
+        if still_picker:
+            logger.error(f"[{email}] ضغط Email لكن بوب الاختيار ما زال ظاهراً — الكود لم يُرسل")
+            return False
+
+        logger.success(f"[{email}] غادر شاشة Email — بانتظار حقل OTP")
+        return True
 
     async def _click_send_or_continue(self, page: Page, email: str) -> bool:
         """أزرار إرسال فقط — لا تضغط Next هنا (Next بعد إدخال OTP)."""
@@ -2471,6 +2589,17 @@ class TikTokChecker:
                     and not await self.has_code_input(page)
                 )
                 if on_form and account_password and waited > 0 and waited % 25 == 0:
+                    # لا تعيد المحاولة بلا فائدة إذا Internal server error مستمر
+                    try:
+                        body_chk = (await page.inner_text("body"))[:600].lower()
+                        if "internal server error" in body_chk:
+                            logger.error(
+                                f"[{email}] Internal server error ما زال ظاهراً — "
+                                f"البروكسي مرفوض من تيك توك. أوقف الانتظار."
+                            )
+                            return False
+                    except Exception:
+                        pass
                     login_retries += 1
                     logger.info(f"[{email}] ما زال على فورم الدخول — إعادة تعبئة كاملة #{login_retries}")
                     status = await self.submit_email_login(
@@ -2478,6 +2607,9 @@ class TikTokChecker:
                     )
                     if status == "logged_in":
                         return True
+                    if status == "server_block":
+                        logger.error(f"[{email}] حظر تيك توك مستمر — غيّر البروكسي")
+                        return False
                     if status == "verify":
                         email_clicked = False
                     if status == "otp":
