@@ -1,5 +1,6 @@
-"""لوحة تحكم ويب لبوت تعليقات TikTok."""
+"""لوحة تحكم ويب لبوت تعليقات TikTok — جاهزة لـ VPS."""
 import asyncio
+import os
 import threading
 from pathlib import Path
 
@@ -11,12 +12,14 @@ from main import (
     load_accounts_json,
     load_mailboxes,
     load_settings,
+    request_stop_bot,
     run_bot,
     save_accounts_json,
     save_mailboxes,
     save_settings,
+    should_stop,
 )
-from comments_pool import peek_status, set_comments, remaining_count
+from comments_pool import peek_status, set_comments
 
 BASE_DIR = Path(__file__).resolve().parent
 LOG_FILE = BASE_DIR / "tiktok_checker.log"
@@ -26,6 +29,7 @@ bot_state = {
     "running": False,
     "last_result": None,
     "error": None,
+    "thread": None,
 }
 
 
@@ -63,6 +67,7 @@ def bot_worker():
         bot_state["last_result"] = {"ok": False, "error": str(e)}
     finally:
         bot_state["running"] = False
+        bot_state["thread"] = None
 
 
 @app.route("/")
@@ -82,11 +87,12 @@ def api_status():
     if LOG_FILE.exists():
         try:
             text = LOG_FILE.read_text(encoding="utf-8", errors="ignore")
-            log_tail = "\n".join(text.splitlines()[-40:])
+            log_tail = "\n".join(text.splitlines()[-60:])
         except Exception:
             pass
     return jsonify({
         "running": bot_state["running"],
+        "stopping": bool(bot_state["running"] and should_stop()),
         "last_result": bot_state["last_result"],
         "error": bot_state["error"],
         "settings": settings,
@@ -100,9 +106,11 @@ def api_status():
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    import main
-    main.STOP_BOT_FLAG = True
-    return jsonify({"ok": True, "message": "تم إرسال أمر الإيقاف"})
+    if not bot_state["running"]:
+        return jsonify({"ok": True, "message": "البوت متوقف مسبقاً"})
+    request_stop_bot()
+    return jsonify({"ok": True, "message": "تم إرسال أمر الإيقاف — سيتم إغلاق المتصفحات"})
+
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
@@ -114,7 +122,6 @@ def api_settings():
     if isinstance(comments, str):
         comments = [c.strip() for c in comments.split("\n") if c.strip()]
 
-    # تحديث مجمع التعليقات (replace أو append)
     replace_comments = bool(data.get("replace_comments", True))
     if "comment_texts" in data or "comments_append" in data:
         append_raw = data.get("comments_append")
@@ -136,13 +143,15 @@ def api_settings():
         "enable_liking": bool(data.get("enable_liking", True)),
         "enable_commenting": bool(data.get("enable_commenting", True)),
         "enable_sharing": bool(data.get("enable_sharing", True)),
-        "watch_count": int(data.get("watch_count", 0)),
-        "max_browsers": int(data.get("max_browsers", 2)),
-        "browser_headless": bool(data.get("browser_headless", False)),
+        "watch_count": int(data.get("watch_count", 0) or 0),
+        "max_browsers": max(1, int(data.get("max_browsers", 1) or 1)),
+        "browser_headless": bool(data.get("browser_headless", True)),
         "auto_otp": bool(data.get("auto_otp", True)),
         "imap_host": (data.get("imap_host") or "imap.hostinger.com").strip(),
-        "imap_port": int(data.get("imap_port", 993)),
-        "otp_timeout": int(data.get("otp_timeout", 90)),
+        "imap_port": int(data.get("imap_port", 993) or 993),
+        "otp_timeout": int(data.get("otp_timeout", 90) or 90),
+        "dashboard_host": (data.get("dashboard_host") or "0.0.0.0").strip(),
+        "dashboard_port": int(data.get("dashboard_port", 5050) or 5050),
     }
     save_settings(patch)
     return jsonify({"ok": True, "settings": load_settings(), "comments": peek_status()})
@@ -161,7 +170,6 @@ def api_comments():
         comments = [str(c).strip() for c in (raw or []) if str(c).strip()]
     replace = bool(data.get("replace", False))
     stats = set_comments(comments, replace=replace)
-    # مزامنة مع settings
     s = load_settings()
     s["comment_texts"] = peek_status()["pending"]
     save_settings(s)
@@ -220,7 +228,6 @@ def api_accounts():
     data = request.get_json(force=True) or {}
     mailbox = (data.get("mailbox") or "").strip()
 
-    # استيراد دفعة مع ربط mailbox
     if "bulk" in data:
         raw = data.get("bulk") or ""
         if not mailbox:
@@ -296,6 +303,7 @@ def api_start():
         return jsonify({"ok": False, "error": "no_accounts"}), 400
 
     t = threading.Thread(target=bot_worker, daemon=True)
+    bot_state["thread"] = t
     t.start()
     return jsonify({"ok": True, "message": "started"})
 
@@ -310,8 +318,12 @@ def api_logs():
 
 if __name__ == "__main__":
     setup_logging()
+    settings = load_settings()
+    host = os.environ.get("HOST") or settings.get("dashboard_host") or "0.0.0.0"
+    port = int(os.environ.get("PORT") or settings.get("dashboard_port") or 5050)
     print("=" * 50)
     print("  TikTok Bot Dashboard")
-    print("  http://127.0.0.1:5050")
+    print(f"  http://{host}:{port}")
+    print("  (VPS: افتح البورت في الجدار الناري)")
     print("=" * 50)
-    app.run(host="127.0.0.1", port=5050, debug=False, use_reloader=False)
+    app.run(host=host, port=port, debug=False, use_reloader=False)

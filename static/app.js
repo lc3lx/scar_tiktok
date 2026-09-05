@@ -29,9 +29,12 @@ function settingsPayload() {
     enable_sharing: document.getElementById("shareEnabled").checked,
     enable_commenting: document.getElementById("commentEnabled").checked,
     auto_otp: document.getElementById("autoOtp").checked,
+    browser_headless: document.getElementById("headless").checked,
     watch_count: Number(document.getElementById("watchCount").value || 0),
     max_browsers: Number(document.getElementById("maxBrowsers").value || 1),
     otp_timeout: Number(document.getElementById("otpTimeout").value || 90),
+    imap_host: document.getElementById("imapHost").value || "imap.hostinger.com",
+    imap_port: Number(document.getElementById("imapPort").value || 993),
   };
 }
 
@@ -50,9 +53,12 @@ function fillSettings(s, comments) {
   document.getElementById("shareEnabled").checked = s.enable_sharing !== false;
   document.getElementById("commentEnabled").checked = !!s.enable_commenting;
   document.getElementById("autoOtp").checked = s.auto_otp !== false;
+  document.getElementById("headless").checked = s.browser_headless !== false;
   document.getElementById("watchCount").value = s.watch_count ?? 0;
   document.getElementById("maxBrowsers").value = s.max_browsers || 1;
   document.getElementById("otpTimeout").value = s.otp_timeout || 90;
+  document.getElementById("imapHost").value = s.imap_host || "imap.hostinger.com";
+  document.getElementById("imapPort").value = s.imap_port || 993;
   if (comments) fillComments(comments);
   else fillComments({ pending: s.comment_texts || [], pending_count: (s.comment_texts || []).length, used_count: 0 });
 }
@@ -165,18 +171,26 @@ function escapeAttr(s) {
   return String(s).replace(/"/g, "&quot;");
 }
 
-function setRunning(running, error) {
+function setRunning(running, error, stopping) {
   const dot = document.getElementById("statusDot");
   const text = document.getElementById("statusText");
   const startBtn = document.getElementById("startBot");
   const stopBtn = document.getElementById("stopBot");
-  dot.className = "dot" + (running ? " running" : error ? " error" : "");
-  text.textContent = running ? "يعمل الآن..." : error ? "توقف بخطأ" : "جاهز";
+  if (stopping) {
+    dot.className = "dot running";
+    text.textContent = "جاري الإيقاف...";
+  } else {
+    dot.className = "dot" + (running ? " running" : error ? " error" : "");
+    text.textContent = running ? "يعمل الآن..." : error ? "توقف بخطأ" : "جاهز";
+  }
   startBtn.style.display = running ? "none" : "inline-block";
   stopBtn.style.display = running ? "inline-block" : "none";
-  document.getElementById("runHint").textContent = running
-    ? "البوت يعمل — راقب اللوقز بالأسفل"
-    : "احفظ الإعدادات ثم شغّل البوت";
+  stopBtn.disabled = !!stopping;
+  document.getElementById("runHint").textContent = stopping
+    ? "يتم إيقاف البوت وإغلاق المتصفحات..."
+    : running
+    ? "البوت يعمل — يمكنك الإيقاف في أي وقت"
+    : "عدّل الإعدادات من الأعلى ثم شغّل البوت";
 }
 
 async function refresh() {
@@ -185,7 +199,7 @@ async function refresh() {
     fillSettings(data.settings || {}, data.comments);
     renderMailboxes(data.mailboxes || []);
     renderAccounts(data.accounts || []);
-    setRunning(data.running, data.error);
+    setRunning(data.running, data.error, data.stopping);
     if (data.logs) document.getElementById("logs").textContent = data.logs;
   } catch (e) {
     console.error(e);
@@ -322,7 +336,7 @@ document.getElementById("startBot").addEventListener("click", async () => {
       body: JSON.stringify(settingsPayload()),
     });
     await api("/api/start", { method: "POST", body: "{}" });
-    setRunning(true);
+    setRunning(true, null, false);
     toast("بدأ التشغيل");
   } catch (e) {
     toast("فشل التشغيل: " + e.message);
@@ -332,7 +346,8 @@ document.getElementById("startBot").addEventListener("click", async () => {
 document.getElementById("stopBot").addEventListener("click", async () => {
   try {
     await api("/api/stop", { method: "POST", body: "{}" });
-    toast("تم إرسال أمر الإيقاف، يرجى الانتظار...");
+    setRunning(true, null, true);
+    toast("تم إرسال أمر الإيقاف...");
   } catch (e) {
     toast("فشل الإيقاف: " + e.message);
   }
@@ -342,7 +357,7 @@ refresh();
 setInterval(async () => {
   try {
     const data = await api("/api/status");
-    setRunning(data.running, data.error);
+    setRunning(data.running, data.error, data.stopping);
     renderMailboxes(data.mailboxes || []);
     renderAccounts(data.accounts || []);
     if (data.comments) fillComments(data.comments);

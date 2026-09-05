@@ -1,35 +1,47 @@
 # scar_tiktok
 
-بوت TikTok لمشاهدة فيديوهات حساب محدد، لايك، شير، وتعليق — مع لوحة تحكم ويب و OTP تلقائي من Hostinger.
+بوت TikTok قابل للتحكم بالكامل من لوحة ويب — جاهز للرفع على VPS للزبون.
 
-## التشغيل السريع
+## ماذا يتحكم الزبون من الواجهة؟
+
+- رابط البروفايل / الفيديو ووضع التشغيل
+- لايك / شير / تعليق / OTP / Headless
+- عدد المتصفحات ومهلة OTP و IMAP
+- حسابات Hostinger وحسابات TikTok
+- مجمع التعليقات
+- **تشغيل** و **إيقاف** البوت + مشاهدة اللوقز مباشرة
+
+## تشغيل على VPS
 
 ```bash
 pip install -r requirements.txt
 playwright install chromium
+playwright install-deps chromium   # على Linux إن لزم
 ```
 
-انسخ ملفات الإعداد:
+أنشئ الملفات محلياً (لا تُرفع للـ Git):
 
 ```bash
-copy accounts.example.json accounts.json
-copy mailboxes.example.json mailboxes.json
+cp accounts.example.json accounts.json
+cp mailboxes.example.json mailboxes.json
 ```
 
-عدّل `accounts.json` و `mailboxes.json` و `settings.json`، ثم:
+ثم:
 
 ```bash
 python app.py
 ```
 
-افتح: http://127.0.0.1:5050
+اللوحة تفتح على كل الواجهات افتراضياً: `http://IP:5050`
 
-أو شغّل مباشرة:
+يمكنك تغيير المنفذ:
 
 ```bash
-python main.py
+PORT=8080 python app.py
 ```
 
-## ملاحظات أمان
+افتح البورت في الجدار الناري/Security Group.
 
-لا ترفع `accounts.json` أو `mailboxes.json` أو مجلد `accounts/` (جلسات وكلمات سر) إلى GitHub.
+## ملاحظة
+
+الإعدادات تُحفظ في `settings.json` تلقائياً عند التعديل من الواجهة — لا حاجة لتعديل ملفات يدوياً بعد التثبيت الأولي للحسابات.

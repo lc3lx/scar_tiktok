@@ -18,6 +18,72 @@ from comments_pool import take_comment, remaining_count, migrate_from_settings, 
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
 
 STOP_BOT_FLAG = False
+ACTIVE_BROWSERS: List[Any] = []
+_BOT_LOOP = None  # event loop الخاص بتشغيل البوت
+
+
+def request_stop_bot():
+    """طلب إيقاف البوت من الواجهة."""
+    global STOP_BOT_FLAG
+    STOP_BOT_FLAG = True
+    logger.warning("تم طلب إيقاف البوت من لوحة التحكم")
+    loop = _BOT_LOOP
+    if loop is not None:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(_close_all_browsers(), loop)
+            fut.result(timeout=8)
+        except Exception as e:
+            logger.warning(f"إغلاق المتصفحات أثناء الإيقاف: {e}")
+
+
+def should_stop() -> bool:
+    return STOP_BOT_FLAG
+
+
+async def _close_all_browsers():
+    for browser in list(ACTIVE_BROWSERS):
+        try:
+            await browser.close()
+        except Exception:
+            pass
+    ACTIVE_BROWSERS.clear()
+
+
+async def unregister_browser(browser):
+    try:
+        if browser in ACTIVE_BROWSERS:
+            ACTIVE_BROWSERS.remove(browser)
+    except Exception:
+        pass
+    try:
+        await browser.close()
+    except Exception:
+        pass
+
+
+async def launch_browser(playwright, config: "Config"):
+    """يشغّل متصفح مناسب للجهاز (Edge على ويندوز، Chrome/Chromium على VPS)."""
+    kwargs = {
+        "headless": config.browser_headless,
+        "args": list(config.browser_args),
+    }
+    edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+    chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
+    if os.path.exists(edge):
+        kwargs["executable_path"] = edge
+        browser = await playwright.chromium.launch(**kwargs)
+    elif os.path.exists(chrome_win):
+        kwargs["executable_path"] = chrome_win
+        browser = await playwright.chromium.launch(**kwargs)
+    else:
+        # Linux VPS: جرّب chrome ثم chromium الافتراضي من Playwright
+        try:
+            browser = await playwright.chromium.launch(channel="chrome", **kwargs)
+        except Exception:
+            browser = await playwright.chromium.launch(**kwargs)
+    ACTIVE_BROWSERS.append(browser)
+    return browser
+
 
 def _dbg(hypothesis_id: str, location: str, message: str, data: dict = None, run_id: str = "pre-fix"):
     try:
@@ -88,20 +154,22 @@ def resolve_mailbox(mailbox_email: str) -> Optional[Dict]:
 def load_settings() -> dict:
     defaults = {
         "target_video_url": "",
-        "profile_url": "https://www.tiktok.com/@scaralphaai",
+        "profile_url": "",
         "bot_mode": "watch",  # comment | watch
-        "comment_texts": ["بطل", "وحش"],
+        "comment_texts": [],
         "comment_all_in_order": True,
         "enable_liking": True,
         "enable_commenting": True,
         "enable_sharing": True,
         "watch_count": 0,  # 0 = لا نهائي
-        "max_browsers": 2,
-        "browser_headless": False,
+        "max_browsers": 1,
+        "browser_headless": True,
         "imap_host": "imap.hostinger.com",
         "imap_port": 993,
         "otp_timeout": 90,
         "auto_otp": True,
+        "dashboard_host": "0.0.0.0",
+        "dashboard_port": 5050,
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -892,6 +960,9 @@ class TikTokActions:
         min_watch = 15  # أقل مدة مشاهدة قبل الانتقال
 
         while time.time() - started < max_wait:
+            if should_stop():
+                logger.info(f"[{email}] إيقاف المشاهدة بأمر الواجهة")
+                return False
             if await self.has_playback_error():
                 logger.warning(f"[{email}] ظهر خطأ تشغيل أثناء المشاهدة — refresh")
                 if not await self.ensure_video_plays(email, video_url=video_url):
@@ -1132,8 +1203,7 @@ class TikTokActions:
         commented_once = False
 
         while max_n <= 0 or n < max_n:
-            global STOP_BOT_FLAG
-            if STOP_BOT_FLAG:
+            if should_stop():
                 logger.info(f"[{email}] توقف البوت بسبب أمر الإيقاف")
                 break
             videos = await self.collect_profile_videos(
@@ -1147,7 +1217,7 @@ class TikTokActions:
 
             progressed = False
             for video_url in videos:
-                if STOP_BOT_FLAG:
+                if should_stop():
                     break
                 if max_n > 0 and n >= max_n:
                     break
@@ -1618,11 +1688,7 @@ class TikTokChecker:
 
             try:
                 async with async_playwright() as p:
-                    browser = await p.chromium.launch(
-                        headless=self.config.browser_headless,
-                        args=self.config.browser_args,
-                        executable_path=r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-                    )
+                    browser = await launch_browser(p, self.config)
 
                     session_file = self.file_handler.session_path(email)
                     context_kwargs = dict(self.config.browser_context_options)
@@ -1721,7 +1787,7 @@ class TikTokChecker:
                             self.successful_logins.append((browser, context))
                             return True
                         await context.close()
-                        await browser.close()
+                        await unregister_browser(browser)
                         return True
 
                     # ===== وضع التعليق على فيديو محدد =====
@@ -1812,11 +1878,11 @@ class TikTokChecker:
                             return True
                         else:
                             await context.close()
-                            await browser.close()
+                            await unregister_browser(browser)
                             return True
 
                     await context.close()
-                    await browser.close()
+                    await unregister_browser(browser)
                     return False
 
             except Exception as e:
@@ -1824,7 +1890,7 @@ class TikTokChecker:
 
                 if browser and not context:
                     try:
-                        await browser.close()
+                        await unregister_browser(browser)
                     except:
                         pass
 
@@ -1851,9 +1917,8 @@ class AccountProcessor:
 
     async def worker(self, worker_id: int, semaphore: asyncio.Semaphore):
         """Обработчик для одного параллельного потока проверки"""
-        global STOP_BOT_FLAG
         while True:
-            if STOP_BOT_FLAG:
+            if should_stop():
                 logger.info(f"Worker {worker_id} stopping due to STOP_BOT_FLAG")
                 break
             async with self.lock:
@@ -1919,22 +1984,26 @@ class AccountProcessor:
                 f"Успешный вход в {len(self.checker.successful_logins)} аккаунтов. Скрипт находится в режиме ожидания...")
             try:
                 while True:
+                    if should_stop():
+                        logger.info("إيقاف وضع الانتظار بأمر الواجهة")
+                        break
                     logger.info("Скрипт продолжает работу... Сессии браузера активны.")
                     await asyncio.sleep(self.config.hang_check_interval)
             except KeyboardInterrupt:
                 logger.info("Получен сигнал остановки. Закрываем браузеры...")
-                for browser, context in self.checker.successful_logins:
-                    try:
-                        await context.close()
-                        await browser.close()
-                    except:
-                        pass
+            for browser, context in self.checker.successful_logins:
+                try:
+                    await context.close()
+                    await unregister_browser(browser)
+                except:
+                    pass
 
 
 async def run_bot(config: Config = None) -> dict:
     """تشغيل البوت من الواجهة أو من سطر الأوامر."""
-    global STOP_BOT_FLAG
+    global STOP_BOT_FLAG, _BOT_LOOP
     STOP_BOT_FLAG = False
+    _BOT_LOOP = asyncio.get_running_loop()
 
     if config is None:
         config = Config.from_settings()
@@ -1967,7 +2036,10 @@ async def run_bot(config: Config = None) -> dict:
     processor = AccountProcessor(accounts, config)
     await processor.process_all()
     report = await processor.stats.get_report()
-    return {"ok": True, "report": report, "stats": processor.stats.counters}
+    await _close_all_browsers()
+    global _BOT_LOOP
+    _BOT_LOOP = None
+    return {"ok": True, "report": report, "stats": processor.stats.counters, "stopped": should_stop()}
 
 
 async def main():

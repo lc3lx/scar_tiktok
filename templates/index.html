@@ -15,7 +15,7 @@
       <div>
         <p class="brand">TikTok Comment Bot</p>
         <h1>لوحة التحكم</h1>
-        <p class="sub">إدارة الحسابات، رابط الفيديو، OTP من Hostinger، وتشغيل البوت</p>
+        <p class="sub">كل شيء من الواجهة: الحسابات، الإعدادات، التعليقات، تشغيل وإيقاف البوت</p>
       </div>
       <div class="status-box" id="statusBox">
         <span class="dot" id="statusDot"></span>
@@ -55,16 +55,28 @@
           <label class="check"><input type="checkbox" id="shareEnabled" checked /> شير</label>
           <label class="check"><input type="checkbox" id="commentEnabled" checked /> تعليق (من المجمع)</label>
           <label class="check"><input type="checkbox" id="autoOtp" checked /> OTP تلقائي</label>
+          <label class="check"><input type="checkbox" id="headless" checked /> Headless (VPS بدون شاشة)</label>
         </div>
 
         <div class="row two">
           <div>
-            <label>عدد المتصفحات</label>
+            <label>عدد المتصفحات المتوازية</label>
             <input id="maxBrowsers" type="number" min="1" max="10" value="1" />
           </div>
           <div>
             <label>مهلة OTP (ثانية)</label>
             <input id="otpTimeout" type="number" min="30" max="300" value="90" />
+          </div>
+        </div>
+
+        <div class="row two">
+          <div>
+            <label>IMAP Host</label>
+            <input id="imapHost" type="text" placeholder="imap.hostinger.com" />
+          </div>
+          <div>
+            <label>IMAP Port</label>
+            <input id="imapPort" type="number" min="1" max="65535" value="993" />
           </div>
         </div>
 
@@ -130,11 +142,13 @@
     <section class="panel run-panel">
       <div class="row between">
         <div>
-          <h2>تشغيل</h2>
-          <p class="hint" id="runHint">احفظ الإعدادات ثم شغّل البوت</p>
+          <h2>تشغيل / إيقاف</h2>
+          <p class="hint" id="runHint">عدّل الإعدادات من الأعلى ثم شغّل أو أوقف البوت من هنا</p>
         </div>
-        <button class="btn go" id="startBot">تشغيل البوت</button>
-        <button class="btn" id="stopBot" style="background: #e74c3c; color: white; display: none;">إيقاف البوت</button>
+        <div class="row gap" id="runButtons">
+          <button class="btn go" id="startBot">تشغيل البوت</button>
+          <button class="btn danger" id="stopBot" style="display:none">إيقاف البوت</button>
+        </div>
       </div>
       <pre class="logs" id="logs">اللوقز ستظهر هنا...</pre>
     </section>

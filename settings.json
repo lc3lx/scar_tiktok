@@ -1,20 +1,19 @@
 {
-  "target_video_url": "https://www.tiktok.com/@scaralphaai/video/7680704444190821654",
+  "target_video_url": "",
   "profile_url": "",
   "bot_mode": "watch",
-  "comment_texts": [
-    "بطل",
-    "وحش"
-  ],
+  "comment_texts": [],
   "comment_all_in_order": true,
   "enable_liking": true,
   "enable_commenting": true,
   "enable_sharing": true,
   "watch_count": 0,
-  "max_browsers": 2,
-  "browser_headless": false,
+  "max_browsers": 1,
+  "browser_headless": true,
   "imap_host": "imap.hostinger.com",
   "imap_port": 993,
   "otp_timeout": 90,
-  "auto_otp": true
+  "auto_otp": true,
+  "dashboard_host": "0.0.0.0",
+  "dashboard_port": 5050
 }
