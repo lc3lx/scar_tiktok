@@ -14,7 +14,7 @@ from tiktok_captcha_solver import AsyncPlaywrightSolver
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-05-otp-v5"
+BOT_VERSION = "2026-09-05-otp-v6"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -1767,6 +1767,213 @@ class TikTokChecker:
         except Exception as e:
             logger.warning(f"[{email}] تخطي حل الكابتشا: {type(e).__name__}: {e}")
 
+    async def page_has_captcha(self, page: Page) -> bool:
+        try:
+            for sel in [
+                'iframe[src*="captcha"]',
+                'iframe[src*="verify"]',
+                '#captcha-verify-container',
+                '[id*="captcha"]',
+                '[class*="captcha"]',
+                'div[class*="verify-wrap"]',
+                'div[class*="captcha-disable"]',
+            ]:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    return True
+            body = (await page.inner_text("body"))[:2000].lower()
+            if "drag the slider" in body or "verify to continue" in body:
+                return True
+            if "slide" in body and "puzzle" in body:
+                return True
+        except Exception:
+            pass
+        return False
+
+    async def log_login_state(self, page: Page, email: str, tag: str = "login-state") -> None:
+        """تشخيص لماذا بقي على فورم الدخول."""
+        try:
+            info = await page.evaluate(
+                """() => {
+                    const inputs = Array.from(document.querySelectorAll('input')).slice(0,12).map(i => ({
+                      type: i.type, name: i.name, ph: i.placeholder,
+                      valLen: (i.value||'').length,
+                      visible: !!(i.offsetParent || i.getClientRects().length)
+                    }));
+                    const buttons = Array.from(document.querySelectorAll('button')).slice(0,10).map(b => ({
+                      text: (b.innerText||'').trim().slice(0,40),
+                      disabled: b.disabled,
+                      e2e: b.getAttribute('data-e2e'),
+                      visible: !!(b.offsetParent || b.getClientRects().length)
+                    }));
+                    const body = (document.body?.innerText||'').replace(/\\s+/g,' ').slice(0,500);
+                    return {url: location.href, title: document.title, inputs, buttons, body};
+                }"""
+            )
+            logger.warning(f"[{email}] {tag}: {info}")
+            # #region agent log
+            _dbg("LOGIN", "main.py:log_login_state", tag, {"email": email, "info": info}, run_id="pre-fix")
+            # #endregion
+        except Exception as e:
+            logger.warning(f"[{email}] {tag} failed: {e}")
+
+    async def submit_email_login(
+        self,
+        page: Page,
+        email: str,
+        password: str,
+        captcha_solver=None,
+        attempt: int = 1,
+    ) -> str:
+        """
+        يملأ فورم الدخول ويضغط Log in.
+        يرجع: 'logged_in' | 'verify' | 'otp' | 'captcha' | 'error' | 'form'
+        """
+        logger.info(f"[{email}] تعبئة فورم الدخول (محاولة {attempt})...")
+
+        # كوكيز / overlays
+        try:
+            for sel in [
+                'button:has-text("Accept all")',
+                'button:has-text("Allow all")',
+                'button:has-text("Got it")',
+                'button:has-text("Close")',
+            ]:
+                btn = page.locator(sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    await asyncio.sleep(0.5)
+        except Exception:
+            pass
+
+        email_sel = [
+            'input[name="username"]',
+            'input[autocomplete="username"]',
+            'input[placeholder*="Email" i]',
+            'input[placeholder*="email" i]',
+            'input[type="email"]',
+            'input[type="text"]',
+        ]
+        pass_sel = [
+            'input[type="password"]',
+            'input[autocomplete="current-password"]',
+            'input[placeholder*="Password" i]',
+        ]
+        btn_sel = [
+            'button[data-e2e="login-button"]',
+            'button:has-text("Log in")',
+            'button[type="submit"]',
+        ]
+
+        email_input = None
+        for sel in email_sel:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    email_input = loc
+                    break
+            except Exception:
+                continue
+
+        password_input = None
+        for sel in pass_sel:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    password_input = loc
+                    break
+            except Exception:
+                continue
+
+        login_button = None
+        for sel in btn_sel:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    login_button = loc
+                    break
+            except Exception:
+                continue
+
+        if not email_input or not password_input or not login_button:
+            await self.log_login_state(page, email, "form-missing")
+            logger.warning(f"[{email}] عناصر فورم الدخول غير مكتملة")
+            return "form"
+
+        try:
+            await email_input.click(force=True)
+            await email_input.fill("")
+            await email_input.type(email, delay=25)
+            await asyncio.sleep(0.4)
+            await password_input.click(force=True)
+            await password_input.fill("")
+            await password_input.type(password, delay=25)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"[{email}] فشل تعبئة الحقول: {e}")
+            await self.log_login_state(page, email, "fill-fail")
+            return "form"
+
+        # فعّل الزر إن أمكن
+        try:
+            for _ in range(10):
+                disabled = await login_button.get_attribute("disabled")
+                aria = await login_button.get_attribute("aria-disabled")
+                if disabled is None and aria != "true":
+                    break
+                await asyncio.sleep(0.3)
+        except Exception:
+            pass
+
+        try:
+            await login_button.click(timeout=5000)
+        except Exception:
+            try:
+                await login_button.click(force=True)
+            except Exception as e:
+                logger.warning(f"[{email}] فشل ضغط Log in: {e}")
+                return "form"
+
+        logger.info(f"[{email}] تم ضغط Log in — انتظار Verify/كابتشا...")
+        await asyncio.sleep(2)
+        await self.safe_solve_captcha(captcha_solver, email)
+
+        # انتظر حتى 20 ثانية لانتقال
+        for i in range(20):
+            if await self.is_logged_in(page):
+                return "logged_in"
+            if await self.has_code_input(page):
+                return "otp"
+            if await self.has_verify_method_picker(page):
+                return "verify"
+            if await self.page_has_captcha(page):
+                logger.warning(f"[{email}] ظهرت كابتشا بعد Log in")
+                await self.safe_solve_captcha(captcha_solver, email)
+                if not captcha_solver:
+                    await self.log_login_state(page, email, "captcha-no-key")
+                    return "captcha"
+            # رسائل خطأ
+            try:
+                body = (await page.inner_text("body"))[:1500].lower()
+                for err in (
+                    "incorrect",
+                    "wrong password",
+                    "couldn't find",
+                    "maximum number of attempts",
+                    "try again later",
+                    "too many",
+                ):
+                    if err in body:
+                        logger.error(f"[{email}] خطأ تسجيل دخول ظاهر في الصفحة: {err}")
+                        await self.log_login_state(page, email, "login-error")
+                        return "error"
+            except Exception:
+                pass
+            await asyncio.sleep(1)
+
+        await self.log_login_state(page, email, "still-on-form")
+        return "form"
+
     async def is_logged_in(self, page: Page) -> bool:
         """يتحقق إذا المستخدم مسجّل دخول فعلاً."""
         url = page.url or ""
@@ -2218,14 +2425,17 @@ class TikTokChecker:
         mailbox_login: str = None,
         email_already_clicked: bool = False,
         otp_after_ts: float = None,
+        account_password: str = None,
+        captcha_solver=None,
     ) -> bool:
-        """ينتظر اكتمال الدخول: Email → جلب OTP → إدخال → Next."""
+        """ينتظر اكتمال الدخول: فورم → Email → OTP → Next."""
         after_ts = otp_after_ts if otp_after_ts is not None else (time.time() - 5)
         waited = 0
         otp_attempts = 0
         max_otp_attempts = 3
         email_clicked = bool(email_already_clicked)
         mailbox_login = mailbox_login or email
+        login_retries = 0
 
         logger.warning(
             f"[{email}] انتظار الدخول (OTP من Hostinger: {mailbox_login}) — حتى {max_wait}ث..."
@@ -2238,19 +2448,34 @@ class TikTokChecker:
                 logger.success(f"[{email}] تم تسجيل الدخول بنجاح")
                 return True
 
-            # إن بقي على فورم الدخول — أعد الضغط على Log in
+            # إن بقي على فورم الدخول — أعد التعبئة والضغط (مو فقط Next فارغ)
             try:
                 url = (page.url or "").lower()
-                if "/login/phone-or-email" in url:
-                    pw = page.locator('input[type="password"]').first
-                    btn = page.locator('button[data-e2e="login-button"], button[type="submit"]').first
-                    if await pw.count() > 0 and await pw.is_visible() and await btn.count() > 0:
-                        if waited > 0 and waited % 20 == 0:
-                            logger.info(f"[{email}] ما زال على فورم الدخول — إعادة الضغط على Log in")
-                            await btn.click(force=True)
-                            await asyncio.sleep(3)
-            except Exception:
-                pass
+                on_form = "/login/phone-or-email" in url or (
+                    await page.locator('input[type="password"]').count() > 0
+                    and await page.locator('input[type="password"]').first.is_visible()
+                    and not await self.has_verify_method_picker(page)
+                    and not await self.has_code_input(page)
+                )
+                if on_form and account_password and waited > 0 and waited % 25 == 0:
+                    login_retries += 1
+                    logger.info(f"[{email}] ما زال على فورم الدخول — إعادة تعبئة كاملة #{login_retries}")
+                    status = await self.submit_email_login(
+                        page, email, account_password, captcha_solver, attempt=login_retries + 1
+                    )
+                    if status == "logged_in":
+                        return True
+                    if status == "verify":
+                        email_clicked = False
+                    if status == "otp":
+                        email_clicked = True
+                        after_ts = time.time() - 30
+                    if status == "captcha":
+                        logger.error(
+                            f"[{email}] كابتشا بدون مفتاح SadCaptcha — لن يمر الدخول تلقائياً"
+                        )
+            except Exception as e:
+                logger.debug(f"[{email}] login retry: {e}")
 
             # 1) شاشة اختيار الطريقة → اضغط Email مرة واحدة فقط
             if not email_clicked and await self.has_verify_method_picker(page):
@@ -2262,7 +2487,7 @@ class TikTokChecker:
             # إن ظهر حقل الكود بدون المرور بالـ picker
             if not email_clicked and await self.has_code_input(page):
                 email_clicked = True
-                after_ts = time.time() - 30  # قد يكون الكود أُرسل مسبقاً
+                after_ts = time.time() - 30
                 logger.info(f"[{email}] حقل OTP ظاهر مسبقاً")
 
             # 2) بعد اختيار Email أو ظهور حقل الكود → جلب OTP من Hostinger
@@ -2276,7 +2501,6 @@ class TikTokChecker:
                 for _ in range(12):
                     if await self.has_code_input(page) or await self.is_logged_in(page):
                         break
-                    # ربما يحتاج Send مرة ثانية
                     if _ == 4:
                         await self._click_send_or_continue(page, email)
                     await asyncio.sleep(1)
@@ -2286,7 +2510,6 @@ class TikTokChecker:
                     return True
 
                 if not await self.has_code_input(page) and await self.has_verify_method_picker(page):
-                    # لم يُفتح حقل الكود — أعد النقر على Email
                     email_clicked = False
                     if await self.click_email_verification_method(page, email):
                         email_clicked = True
@@ -2315,7 +2538,6 @@ class TikTokChecker:
                         logger.success(f"[{email}] تم تسجيل الدخول بعد OTP")
                         return True
                     if filled:
-                        # ربما يحتاج Next إضافي
                         await self._click_next_after_otp(page, email)
                         await asyncio.sleep(3)
                         if await self.is_logged_in(page):
@@ -2334,8 +2556,11 @@ class TikTokChecker:
             waited += 3
             if waited % 15 == 0:
                 logger.info(f"[{email}] لا يزال ينتظر الدخول... ({waited}/{max_wait}ث) | URL: {page.url}")
+                if waited in (30, 90, 150):
+                    await self.log_login_state(page, email, f"wait-{waited}")
 
         logger.warning(f"[{email}] انتهى وقت انتظار الدخول ({max_wait}ث) | URL: {page.url}")
+        await self.log_login_state(page, email, "timeout")
         return False
 
     async def save_session(self, context, email: str):
@@ -2417,39 +2642,61 @@ class TikTokChecker:
 
                         async def _do_fresh_login() -> bool:
                             await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
+                            await asyncio.sleep(2)
 
-                            email_input = page.locator('input[type="text"]')
-                            password_input = page.locator('input[type="password"]')
-                            login_button = page.locator('button[data-e2e="login-button"], button[type="submit"]')
+                            status = await self.submit_email_login(
+                                page, email, password, captcha_solver, attempt=1
+                            )
+                            logger.info(f"[{email}] نتيجة Log in الأولى: {status}")
 
-                            if await email_input.count() == 0 or await password_input.count() == 0 or await login_button.count() == 0:
-                                logger.warning(f"Не удалось загрузить форму входа для {email} — انتظر الدخول اليدوي")
-                                return await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
-
-                            await email_input.fill(email)
-                            await asyncio.sleep(self.config.action_delay)
-                            await password_input.fill(password)
-                            await asyncio.sleep(self.config.action_delay)
-
-                            await login_button.click()
-                            await asyncio.sleep(self.config.action_delay)
-
-                            await self.safe_solve_captcha(captcha_solver, email)
-
-                            await asyncio.sleep(5)
                             email_sent = False
                             otp_after = None
-                            if await self.has_verify_method_picker(page):
+
+                            if status == "logged_in":
+                                return True
+                            if status == "captcha":
+                                logger.error(
+                                    f"[{email}] كابتشا تمنع الدخول — أضف مفتاح SadCaptcha في الإعدادات "
+                                    f"أو شغّل headless=false للتجربة"
+                                )
+                            if status == "verify":
                                 email_sent = await self.click_email_verification_method(page, email)
                                 if email_sent:
                                     otp_after = time.time() - 1
+                            elif status == "otp":
+                                email_sent = True
+                                otp_after = time.time() - 30
+                            elif status in ("form", "error"):
+                                # محاولة ثانية بعد reload
+                                await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
+                                status2 = await self.submit_email_login(
+                                    page, email, password, captcha_solver, attempt=2
+                                )
+                                logger.info(f"[{email}] نتيجة Log in الثانية: {status2}")
+                                if status2 == "logged_in":
+                                    return True
+                                if status2 == "verify":
+                                    email_sent = await self.click_email_verification_method(page, email)
+                                    if email_sent:
+                                        otp_after = time.time() - 1
+                                elif status2 == "otp":
+                                    email_sent = True
+                                    otp_after = time.time() - 30
+
                             if await self.is_logged_in(page):
                                 return True
+                            if await self.has_verify_method_picker(page) and not email_sent:
+                                email_sent = await self.click_email_verification_method(page, email)
+                                if email_sent:
+                                    otp_after = time.time() - 1
+
                             return await self.wait_for_login(
                                 page, email, email_password,
                                 mailbox_login=mailbox_email,
                                 email_already_clicked=email_sent,
                                 otp_after_ts=otp_after,
+                                account_password=password,
+                                captcha_solver=captcha_solver,
                             )
 
                         if otp_lock is not None:
