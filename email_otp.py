@@ -22,6 +22,25 @@ OTP_PATTERNS = [
 ]
 
 TIKTOK_SENDERS = ("tiktok", "noreply@", "account@", "mail.tiktok")
+IMAP_FOLDERS = ("INBOX", "Junk", "Spam", "Junk E-mail", "Bulk Mail")
+
+# أكواد استُخدمت مسبقاً حتى لا يأخذ حساب ثانٍ نفس الرمز من صندوق مشترك
+_USED_OTPS: dict = {}  # code -> unix ts
+
+
+def mark_otp_used(code: str) -> None:
+    if code:
+        _USED_OTPS[str(code)] = time.time()
+        # نظّف الأقدم من 15 دقيقة
+        cutoff = time.time() - 900
+        for k, ts in list(_USED_OTPS.items()):
+            if ts < cutoff:
+                _USED_OTPS.pop(k, None)
+
+
+def _is_used(code: str) -> bool:
+    ts = _USED_OTPS.get(str(code))
+    return bool(ts and time.time() - ts < 900)
 
 
 def _decode_mime(value: str) -> str:
@@ -98,65 +117,74 @@ def fetch_tiktok_otp(
     try:
         mail = imaplib.IMAP4_SSL(imap_host, imap_port)
         mail.login(email_addr, email_password)
-        mail.select("INBOX")
 
-        status, data = mail.search(None, "ALL")
-        if status != "OK" or not data or not data[0]:
-            mail.logout()
-            return None
-
-        ids = data[0].split()
         best_code = None
         best_score = -1
 
-        for msg_id in reversed(ids[-30:]):
-            status, msg_data = mail.fetch(msg_id, "(RFC822)")
-            if status != "OK" or not msg_data or not msg_data[0]:
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-
-            sender = _decode_mime(msg.get("From", "")).lower()
-            subject = _decode_mime(msg.get("Subject", ""))
-            to_hdr = _decode_mime(msg.get("To", "")).lower()
-            cc_hdr = _decode_mime(msg.get("Cc", "")).lower()
-            delivered = _decode_mime(msg.get("Delivered-To", "")).lower()
-            date_hdr = msg.get("Date")
-
-            if not any(s in sender for s in TIKTOK_SENDERS) and "tiktok" not in subject.lower():
-                continue
-
+        for folder in IMAP_FOLDERS:
             try:
-                msg_dt = parsedate_to_datetime(date_hdr)
-                if msg_dt.tzinfo is None:
-                    msg_dt = msg_dt.replace(tzinfo=timezone.utc)
-                msg_ts = msg_dt.timestamp()
+                status, _ = mail.select(folder)
+                if status != "OK":
+                    continue
             except Exception:
-                msg_ts = time.time()
-
-            if msg_ts < after_ts - 5:
-                continue
-            if time.time() - msg_ts > max_age_seconds:
                 continue
 
-            body = _extract_body(msg)
-            combined = f"{subject}\n{to_hdr}\n{cc_hdr}\n{delivered}\n{body}"
-            code = extract_otp(combined)
-            if not code:
+            status, data = mail.search(None, "ALL")
+            if status != "OK" or not data or not data[0]:
                 continue
 
-            # تفضيل الرسائل الموجهة لحساب TikTok المحدد
-            score = 1
-            if target and target in combined.lower():
-                score = 10
-            elif target and target.split("@")[0] in combined.lower():
-                score = 5
+            ids = data[0].split()
+            for msg_id in reversed(ids[-40:]):
+                status, msg_data = mail.fetch(msg_id, "(RFC822)")
+                if status != "OK" or not msg_data or not msg_data[0]:
+                    continue
+                raw = msg_data[0][1]
+                msg = email.message_from_bytes(raw)
 
-            if score > best_score:
-                best_score = score
-                best_code = code
-                if score >= 10:
-                    break
+                sender = _decode_mime(msg.get("From", "")).lower()
+                subject = _decode_mime(msg.get("Subject", ""))
+                to_hdr = _decode_mime(msg.get("To", "")).lower()
+                cc_hdr = _decode_mime(msg.get("Cc", "")).lower()
+                delivered = _decode_mime(msg.get("Delivered-To", "")).lower()
+                date_hdr = msg.get("Date")
+
+                if not any(s in sender for s in TIKTOK_SENDERS) and "tiktok" not in subject.lower():
+                    continue
+
+                try:
+                    msg_dt = parsedate_to_datetime(date_hdr)
+                    if msg_dt.tzinfo is None:
+                        msg_dt = msg_dt.replace(tzinfo=timezone.utc)
+                    msg_ts = msg_dt.timestamp()
+                except Exception:
+                    msg_ts = time.time()
+
+                if msg_ts < after_ts - 5:
+                    continue
+                if time.time() - msg_ts > max_age_seconds:
+                    continue
+
+                body = _extract_body(msg)
+                combined = f"{subject}\n{to_hdr}\n{cc_hdr}\n{delivered}\n{body}"
+                code = extract_otp(combined)
+                if not code or _is_used(code):
+                    continue
+
+                score = 1
+                if folder != "INBOX":
+                    score = 2
+                if target and target in combined.lower():
+                    score = 10
+                elif target and target.split("@")[0] in combined.lower():
+                    score = 5
+
+                if score > best_score:
+                    best_score = score
+                    best_code = code
+                    if score >= 10:
+                        break
+            if best_score >= 10:
+                break
 
         mail.logout()
         if best_code:

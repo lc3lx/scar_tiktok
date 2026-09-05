@@ -11,10 +11,10 @@ from playwright.async_api import async_playwright, Page
 from playwright_stealth import Stealth
 from tiktok_captcha_solver import AsyncPlaywrightSolver
 
-from email_otp import wait_for_otp
+from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-05-comment-v3"
+BOT_VERSION = "2026-09-05-otp-v4"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -22,6 +22,15 @@ _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debu
 STOP_BOT_FLAG = False
 ACTIVE_BROWSERS: List[Any] = []
 _BOT_LOOP = None  # event loop الخاص بتشغيل البوت
+# قفل عالمي: حسابات متعددة تشترك بنفس صندوق الميل — دخول OTP بالتسلسل فقط
+LOGIN_OTP_LOCK: Optional[asyncio.Lock] = None
+
+
+def get_login_otp_lock() -> asyncio.Lock:
+    global LOGIN_OTP_LOCK
+    if LOGIN_OTP_LOCK is None:
+        LOGIN_OTP_LOCK = asyncio.Lock()
+    return LOGIN_OTP_LOCK
 
 
 def request_stop_bot():
@@ -1864,23 +1873,94 @@ class TikTokChecker:
             domain,
         )
         if clicked:
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
+            # أحياناً بعد اختيار Email يظهر زر Send / Continue / Next لإرسال الرسالة
+            await self._click_send_or_continue(page, email)
+            await asyncio.sleep(2)
             logger.success(f"[{email}] تم اختيار Email — بانتظار وصول الكود")
             return True
 
         logger.warning(f"[{email}] لم يجد خيار Email للضغط")
         return False
 
+    async def _click_send_or_continue(self, page: Page, email: str) -> bool:
+        """بعد اختيار Email: اضغط Send code / Continue / Next إن وُجد."""
+        for btn_sel in [
+            'button:has-text("Send code")',
+            'button:has-text("Send")',
+            'button:has-text("Continue")',
+            'button:has-text("Next")',
+            'button:has-text("Resend")',
+            'button:has-text("Resend code")',
+            'div[role="button"]:has-text("Send code")',
+            'div[role="button"]:has-text("Continue")',
+            'div[role="button"]:has-text("Next")',
+        ]:
+            try:
+                btn = page.locator(btn_sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    # لا تضغط Next إذا حقل الكود فاضي — فقط Send/Continue قبل ظهور الحقل
+                    if "Next" in btn_sel and await self.has_code_input(page):
+                        continue
+                    await btn.click(force=True)
+                    logger.info(f"[{email}] ضغط زر إرسال/متابعة: {btn_sel}")
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def click_resend_otp(self, page: Page, email: str) -> bool:
+        for btn_sel in [
+            'button:has-text("Resend code")',
+            'button:has-text("Resend")',
+            'span:has-text("Resend code")',
+            'a:has-text("Resend")',
+            'div[role="button"]:has-text("Resend")',
+        ]:
+            try:
+                btn = page.locator(btn_sel).first
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    logger.info(f"[{email}] طلب إعادة إرسال الكود")
+                    await asyncio.sleep(2)
+                    return True
+            except Exception:
+                continue
+        return False
+
     async def fill_otp(self, page: Page, code: str, email: str) -> bool:
+        code = (code or "").strip()
+        if not code:
+            return False
+
+        # حقول منفصلة (رقم لكل خانة)
+        try:
+            digit_inputs = page.locator('input[maxlength="1"]')
+            n = await digit_inputs.count()
+            if n >= 4 and n <= 8:
+                for i, ch in enumerate(code[:n]):
+                    inp = digit_inputs.nth(i)
+                    await inp.click(force=True)
+                    await inp.fill(ch)
+                await asyncio.sleep(0.5)
+                await self._click_next_after_otp(page, email)
+                mark_otp_used(code)
+                logger.success(f"[{email}] تم إدخال OTP (خانات): {code}")
+                await asyncio.sleep(3)
+                return True
+        except Exception:
+            pass
+
         selectors = [
             'input[name="verifyCode"]',
             '.verification-code-input',
+            'input[placeholder*="Digit code" i]',
             'input[placeholder*="code" i]',
             'input[placeholder*="Code"]',
             'input[maxlength="6"]',
             'input[maxlength="4"]',
+            'input[autocomplete="one-time-code"]',
             'input[type="tel"]',
-            'input[type="text"]',
         ]
         for sel in selectors:
             loc = page.locator(sel).first
@@ -1890,56 +1970,108 @@ class TikTokChecker:
                 if not await loc.is_visible():
                     continue
                 await loc.click(force=True)
-                await loc.fill("")
-                await loc.type(code, delay=80)
-                await asyncio.sleep(0.8)
-
-                clicked_next = False
-                for btn_sel in [
-                    'button:has-text("Next")',
-                    'button[data-e2e="email-verification-submit"]',
-                    'button[type="submit"]',
-                    'button:has-text("Verify")',
-                    'button:has-text("Continue")',
-                    'button:has-text("Submit")',
-                    'div[role="button"]:has-text("Next")',
-                ]:
-                    btn = page.locator(btn_sel).first
-                    try:
-                        if await btn.count() > 0 and await btn.is_visible():
-                            await btn.click(force=True)
-                            clicked_next = True
-                            logger.info(f"[{email}] تم الضغط على Next بعد OTP")
-                            break
-                    except Exception:
-                        continue
-                if not clicked_next:
-                    await page.keyboard.press("Enter")
-                    logger.info(f"[{email}] تم إرسال OTP بـ Enter")
-
-                logger.success(f"[{email}] تم إدخال OTP تلقائياً: {code}")
-                await asyncio.sleep(3)
-
-                # لو لسا ظاهر Next جرب مرة ثانية
                 try:
-                    nxt = page.locator('button:has-text("Next")').first
-                    if await nxt.count() > 0 and await nxt.is_visible():
-                        await nxt.click(force=True)
-                        await asyncio.sleep(2)
+                    await loc.fill("")
                 except Exception:
                     pass
+                await loc.type(code, delay=60)
+                await asyncio.sleep(0.6)
+                await self._click_next_after_otp(page, email)
+                mark_otp_used(code)
+                logger.success(f"[{email}] تم إدخال OTP تلقائياً: {code}")
+                await asyncio.sleep(3)
                 return True
             except Exception:
                 continue
+
+        # JS fallback
+        try:
+            ok = await page.evaluate(
+                """(code) => {
+                    const inputs = Array.from(document.querySelectorAll('input')).filter(i => {
+                      const m = i.getAttribute('maxlength');
+                      const ph = (i.placeholder||'').toLowerCase();
+                      const n = (i.name||'').toLowerCase();
+                      return i.offsetParent && (
+                        n.includes('verify') || n.includes('code') ||
+                        ph.includes('code') || m === '6' || m === '4'
+                      );
+                    });
+                    if (!inputs.length) return false;
+                    const el = inputs[0];
+                    el.focus();
+                    el.value = code;
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new Event('change', {bubbles:true}));
+                    return true;
+                }""",
+                code,
+            )
+            if ok:
+                await self._click_next_after_otp(page, email)
+                mark_otp_used(code)
+                logger.success(f"[{email}] تم إدخال OTP عبر JS: {code}")
+                await asyncio.sleep(3)
+                return True
+        except Exception:
+            pass
+
         logger.warning(f"[{email}] وجد OTP لكن تعذر إدخاله في الصفحة")
         return False
 
-    async def wait_for_login(self, page: Page, email: str, email_password: str = None, max_wait: int = 180, mailbox_login: str = None) -> bool:
-        """ينتظر اكتمال الدخول مع OTP من Hostinger."""
-        after_ts = time.time() - 5
+    async def _click_next_after_otp(self, page: Page, email: str) -> None:
+        clicked_next = False
+        for btn_sel in [
+            'button:has-text("Next")',
+            'button[data-e2e="email-verification-submit"]',
+            'button[type="submit"]',
+            'button:has-text("Verify")',
+            'button:has-text("Continue")',
+            'button:has-text("Submit")',
+            'button:has-text("Confirm")',
+            'div[role="button"]:has-text("Next")',
+        ]:
+            btn = page.locator(btn_sel).first
+            try:
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    clicked_next = True
+                    logger.info(f"[{email}] تم الضغط على Next بعد OTP")
+                    break
+            except Exception:
+                continue
+        if not clicked_next:
+            try:
+                await page.keyboard.press("Enter")
+                logger.info(f"[{email}] تم إرسال OTP بـ Enter")
+            except Exception:
+                pass
+        await asyncio.sleep(1.5)
+        # لو لسا ظاهر Next جرب مرة ثانية
+        try:
+            nxt = page.locator('button:has-text("Next")').first
+            if await nxt.count() > 0 and await nxt.is_visible():
+                await nxt.click(force=True)
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+    async def wait_for_login(
+        self,
+        page: Page,
+        email: str,
+        email_password: str = None,
+        max_wait: int = 180,
+        mailbox_login: str = None,
+        email_already_clicked: bool = False,
+        otp_after_ts: float = None,
+    ) -> bool:
+        """ينتظر اكتمال الدخول: Email → جلب OTP → إدخال → Next."""
+        after_ts = otp_after_ts if otp_after_ts is not None else (time.time() - 5)
         waited = 0
-        otp_tried = False
-        email_clicked = False
+        otp_attempts = 0
+        max_otp_attempts = 3
+        email_clicked = bool(email_already_clicked)
         mailbox_login = mailbox_login or email
 
         logger.warning(
@@ -1947,55 +2079,103 @@ class TikTokChecker:
         )
 
         while waited < max_wait:
+            if should_stop():
+                return False
             if await self.is_logged_in(page):
                 logger.success(f"[{email}] تم تسجيل الدخول بنجاح")
                 return True
+
+            # إن بقي على فورم الدخول — أعد الضغط على Log in
+            try:
+                url = (page.url or "").lower()
+                if "/login/phone-or-email" in url:
+                    pw = page.locator('input[type="password"]').first
+                    btn = page.locator('button[data-e2e="login-button"], button[type="submit"]').first
+                    if await pw.count() > 0 and await pw.is_visible() and await btn.count() > 0:
+                        if waited > 0 and waited % 20 == 0:
+                            logger.info(f"[{email}] ما زال على فورم الدخول — إعادة الضغط على Log in")
+                            await btn.click(force=True)
+                            await asyncio.sleep(3)
+            except Exception:
+                pass
 
             # 1) شاشة اختيار الطريقة → اضغط Email مرة واحدة فقط
             if not email_clicked and await self.has_verify_method_picker(page):
                 if await self.click_email_verification_method(page, email):
                     email_clicked = True
-                    after_ts = time.time() - 2
+                    after_ts = time.time() - 1
                     await asyncio.sleep(3)
+
+            # إن ظهر حقل الكود بدون المرور بالـ picker
+            if not email_clicked and await self.has_code_input(page):
+                email_clicked = True
+                after_ts = time.time() - 30  # قد يكون الكود أُرسل مسبقاً
+                logger.info(f"[{email}] حقل OTP ظاهر مسبقاً")
 
             # 2) بعد اختيار Email أو ظهور حقل الكود → جلب OTP من Hostinger
             if (
                 self.config.auto_otp
-                and not otp_tried
+                and otp_attempts < max_otp_attempts
                 and email_password
                 and (email_clicked or await self.has_code_input(page))
             ):
-                # انتظر ظهور حقل الكود قليلاً
-                for _ in range(10):
+                # انتظر ظهور حقل الكود
+                for _ in range(12):
                     if await self.has_code_input(page) or await self.is_logged_in(page):
                         break
+                    # ربما يحتاج Send مرة ثانية
+                    if _ == 4:
+                        await self._click_send_or_continue(page, email)
                     await asyncio.sleep(1)
                     waited += 1
 
                 if await self.is_logged_in(page):
                     return True
 
-                logger.info(f"[{email}] جلب OTP من Hostinger ({mailbox_login}) لحساب {email}...")
+                if not await self.has_code_input(page) and await self.has_verify_method_picker(page):
+                    # لم يُفتح حقل الكود — أعد النقر على Email
+                    email_clicked = False
+                    if await self.click_email_verification_method(page, email):
+                        email_clicked = True
+                        after_ts = time.time() - 1
+
+                otp_attempts += 1
+                logger.info(
+                    f"[{email}] جلب OTP من Hostinger ({mailbox_login}) "
+                    f"لحساب {email} (محاولة {otp_attempts}/{max_otp_attempts})..."
+                )
                 code = await asyncio.to_thread(
                     wait_for_otp,
                     mailbox_login,
                     email_password,
-                    timeout=min(self.config.otp_timeout, max(30, max_wait - waited)),
+                    timeout=min(self.config.otp_timeout, max(45, max_wait - waited)),
                     poll_interval=4,
                     imap_host=self.config.imap_host,
                     imap_port=self.config.imap_port,
                     after_ts=after_ts,
                     for_account=email,
                 )
-                otp_tried = True
                 if code:
-                    await self.fill_otp(page, code, email)
+                    filled = await self.fill_otp(page, code, email)
                     await asyncio.sleep(3)
                     if await self.is_logged_in(page):
                         logger.success(f"[{email}] تم تسجيل الدخول بعد OTP")
                         return True
+                    if filled:
+                        # ربما يحتاج Next إضافي
+                        await self._click_next_after_otp(page, email)
+                        await asyncio.sleep(3)
+                        if await self.is_logged_in(page):
+                            return True
                 else:
-                    logger.warning(f"[{email}] لم يُجلب OTP من Hostinger — أكمل يدوياً إن لزم")
+                    logger.warning(f"[{email}] لم يُجلب OTP — محاولة إعادة الإرسال...")
+                    if await self.click_resend_otp(page, email):
+                        after_ts = time.time() - 1
+                    elif await self.has_verify_method_picker(page):
+                        email_clicked = False
+                        if await self.click_email_verification_method(page, email):
+                            email_clicked = True
+                            after_ts = time.time() - 1
 
             await asyncio.sleep(3)
             waited += 3
@@ -2079,38 +2259,53 @@ class TikTokChecker:
                             logger.warning(f"[{email}] الجلسة منتهية — تسجيل دخول جديد")
 
                     if not logged_in:
-                        # Загрузка страницы логина
-                        await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
+                        # حسابات متعددة + صندوق ميل واحد: تسلسل الدخول+OTP
+                        otp_lock = get_login_otp_lock() if self.config.auto_otp else None
 
-                        # Локаторы элементов формы
-                        email_input = page.locator('input[type="text"]')
-                        password_input = page.locator('input[type="password"]')
-                        login_button = page.locator('button[data-e2e="login-button"], button[type="submit"]')
+                        async def _do_fresh_login() -> bool:
+                            await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
 
-                        # Проверка существования элементов формы
-                        if await email_input.count() == 0 or await password_input.count() == 0 or await login_button.count() == 0:
-                            logger.warning(f"Не удалось загрузить форму входа для {email} — انتظر الدخول اليدوي")
-                            logged_in = await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
-                        else:
-                            # Заполнение формы входа
+                            email_input = page.locator('input[type="text"]')
+                            password_input = page.locator('input[type="password"]')
+                            login_button = page.locator('button[data-e2e="login-button"], button[type="submit"]')
+
+                            if await email_input.count() == 0 or await password_input.count() == 0 or await login_button.count() == 0:
+                                logger.warning(f"Не удалось загрузить форму входа для {email} — انتظر الدخول اليدوي")
+                                return await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
+
                             await email_input.fill(email)
                             await asyncio.sleep(self.config.action_delay)
                             await password_input.fill(password)
                             await asyncio.sleep(self.config.action_delay)
 
-                            # Нажатие кнопки входа
                             await login_button.click()
                             await asyncio.sleep(self.config.action_delay)
 
                             await self.safe_solve_captcha(captcha_solver, email)
 
                             await asyncio.sleep(5)
-                            # لو ظهرت شاشة اختيار طريقة التحقق — اضغط Email فوراً
+                            email_sent = False
+                            otp_after = None
                             if await self.has_verify_method_picker(page):
-                                await self.click_email_verification_method(page, email)
-                            logged_in = await self.is_logged_in(page)
-                            if not logged_in:
-                                logged_in = await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
+                                email_sent = await self.click_email_verification_method(page, email)
+                                if email_sent:
+                                    otp_after = time.time() - 1
+                            if await self.is_logged_in(page):
+                                return True
+                            return await self.wait_for_login(
+                                page, email, email_password,
+                                mailbox_login=mailbox_email,
+                                email_already_clicked=email_sent,
+                                otp_after_ts=otp_after,
+                            )
+
+                        if otp_lock is not None:
+                            logger.info(f"[{email}] انتظار دور الدخول/OTP (صندوق ميل مشترك)...")
+                            async with otp_lock:
+                                logger.info(f"[{email}] بدء تسجيل الدخول + OTP")
+                                logged_in = await _do_fresh_login()
+                        else:
+                            logged_in = await _do_fresh_login()
 
                     if not logged_in:
                         logger.warning(f"Аккаунт {email} - НЕВАЛИДНЫЙ ✗ | URL: {page.url}")
@@ -2360,9 +2555,10 @@ class AccountProcessor:
 
 async def run_bot(config: Config = None) -> dict:
     """تشغيل البوت من الواجهة أو من سطر الأوامر."""
-    global STOP_BOT_FLAG, _BOT_LOOP
+    global STOP_BOT_FLAG, _BOT_LOOP, LOGIN_OTP_LOCK
     STOP_BOT_FLAG = False
     _BOT_LOOP = asyncio.get_running_loop()
+    LOGIN_OTP_LOCK = asyncio.Lock()  # قفل جديد على نفس الـ loop
 
     if config is None:
         config = Config.from_settings()
@@ -2381,6 +2577,11 @@ async def run_bot(config: Config = None) -> dict:
     logger.info(f"🎮 الوضع: {config.bot_mode}")
     logger.info(f"💬 تعليقات متبقية في المجمع: {remaining_count()}")
     logger.info(f"👥 أقصى عدد متصفحات متوازية: {config.max_browsers}")
+    if config.auto_otp and config.max_browsers > 1:
+        logger.warning(
+            "⚠️ auto_otp مفعّل مع متصفحات متعددة — "
+            "تسجيل الدخول/OTP سيتم بالتسلسل (صندوق ميل مشترك). يُفضّل max_browsers=1"
+        )
     logger.info(f"📧 OTP تلقائي من Hostinger: {'نعم' if config.auto_otp else 'لا'}")
     if config.proxy_enabled and config.proxy:
         parsed = parse_proxy(config.proxy)
