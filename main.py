@@ -14,6 +14,8 @@ from tiktok_captcha_solver import AsyncPlaywrightSolver
 from email_otp import wait_for_otp
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
+BOT_VERSION = "2026-09-05-comment-v3"
+
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
 
@@ -856,59 +858,121 @@ class TikTokActions:
         logger.info(f"[{email}] فتح قسم التعليقات...")
         await self.dismiss_overlays()
 
-        # إذا الحقل ظاهر مسبقاً
+        # #region agent log
+        _dbg("H2", "main.py:open_comments", "enter", {"email": email, "url": self.page.url, "build": BOT_VERSION}, run_id="pre-fix")
+        # #endregion
+
         if await self._comment_editor():
+            # #region agent log
+            _dbg("H3", "main.py:open_comments", "editor_already_present", {"email": email}, run_id="pre-fix")
+            # #endregion
             return True
 
+        # نقر مباشر عبر JS على شريط الإجراءات يمين الفيديو
+        clicked = None
+        try:
+            clicked = await self.page.evaluate(
+                """() => {
+                    const prefer = [
+                      '[data-e2e="browse-comment-icon"]',
+                      '[data-e2e="comment-icon"]',
+                      'span[data-e2e="comment-icon"]',
+                      'strong[data-e2e="browse-comment-count"]',
+                      'strong[data-e2e="comment-count"]',
+                    ];
+                    for (const s of prefer) {
+                      const el = document.querySelector(s);
+                      if (el) { el.click(); return s; }
+                    }
+                    // أي عنصر عليه أيقونة تعليق
+                    const all = Array.from(document.querySelectorAll('[data-e2e]'));
+                    const hit = all.find(e => (e.getAttribute('data-e2e')||'').toLowerCase().includes('comment'));
+                    if (hit) { hit.click(); return hit.getAttribute('data-e2e'); }
+                    return null;
+                }"""
+            )
+            logger.info(f"[{email}] نقر تعليقات JS: {clicked}")
+            await asyncio.sleep(3)
+        except Exception as e:
+            logger.warning(f"[{email}] JS comment click: {e}")
+
+        # #region agent log
+        _dbg("H2", "main.py:open_comments", "js_click_result", {"email": email, "clicked": clicked}, run_id="pre-fix")
+        # #endregion
+
         icon_sel = [
-            '[data-e2e="comment-icon"]',
             '[data-e2e="browse-comment-icon"]',
+            '[data-e2e="comment-icon"]',
             'span[data-e2e="comment-icon"]',
             'div[data-e2e="comment-icon"]',
             'button[data-e2e="comment-icon"]',
             'strong[data-e2e="comment-count"]',
             'strong[data-e2e="browse-comment-count"]',
-            'button:has-text("Comment")',
-            'div[role="button"]:has-text("Comment")',
         ]
-        btn = await self.find_first(icon_sel, timeout_ms=6000)
-        if btn:
-            try:
-                await btn.click(timeout=4000)
-            except Exception:
+        pw_clicked = False
+        if not await self._comment_editor():
+            btn = await self.find_first(icon_sel, timeout_ms=5000)
+            if btn:
                 try:
-                    await btn.click(force=True)
+                    await btn.click(force=True, timeout=4000)
+                    pw_clicked = True
                 except Exception:
                     pass
-            await asyncio.sleep(2.5)
+                await asyncio.sleep(3)
 
-        # محاولة JS كنقر على أيقونة التعليق
-        if not await self._comment_editor():
-            try:
-                await self.page.evaluate(
-                    """() => {
-                        const nodes = Array.from(document.querySelectorAll('[data-e2e*="comment"], button, span, div'));
-                        const hit = nodes.find(n => {
-                          const e = (n.getAttribute('data-e2e')||'');
-                          const t = (n.innerText||'').trim();
-                          return e.includes('comment-icon') || e.includes('comment-count') || /^\\d+$/.test(t) && e.includes('comment');
-                        });
-                        if (hit) hit.click();
-                    }"""
-                )
-                await asyncio.sleep(2)
-            except Exception:
-                pass
+        # #region agent log
+        _dbg("H2", "main.py:open_comments", "pw_click", {"email": email, "pw_clicked": pw_clicked}, run_id="pre-fix")
+        # #endregion
 
-        ok = bool(await self._comment_editor())
-        if not ok:
-            logger.warning(f"[{email}] لم يجد زر أو حقل التعليقات")
-        return ok
+        # انتظر ظهور الحقل حتى 15 ثانية
+        for wait_i in range(15):
+            if await self._comment_editor():
+                # #region agent log
+                _dbg("H3", "main.py:open_comments", "editor_found_after_wait", {"email": email, "wait_i": wait_i}, run_id="pre-fix")
+                # #endregion
+                return True
+            await asyncio.sleep(1)
+
+        await self._log_comment_dom(email)
+        # #region agent log
+        _dbg("H4", "main.py:open_comments", "failed_no_editor", {"email": email, "url": self.page.url}, run_id="pre-fix")
+        # #endregion
+        logger.warning(f"[{email}] لم يجد زر أو حقل التعليقات")
+        return False
+
+    async def _log_comment_dom(self, email: str) -> None:
+        try:
+            info = await self.page.evaluate(
+                """() => ({
+                    url: location.href,
+                    editables: Array.from(document.querySelectorAll('[contenteditable], textarea')).slice(0,12).map(e => ({
+                      tag: e.tagName,
+                      e2e: e.closest('[data-e2e]')?.getAttribute('data-e2e') || e.getAttribute('data-e2e'),
+                      visible: !!(e.offsetParent || e.getClientRects().length),
+                      lexical: e.getAttribute('data-lexical-editor'),
+                      cls: (e.className||'').toString().slice(0,80)
+                    })),
+                    commentNodes: Array.from(document.querySelectorAll('[data-e2e*="comment"]')).slice(0,25).map(e => ({
+                      e2e: e.getAttribute('data-e2e'),
+                      tag: e.tagName,
+                      visible: !!(e.offsetParent || e.getClientRects().length),
+                      text: (e.innerText||'').trim().slice(0,40)
+                    }))
+                })"""
+            )
+            logger.warning(f"[{email}] comment-dom: {info}")
+            # #region agent log
+            _dbg("CMT", "main.py:_log_comment_dom", "dom_snapshot", {"email": email, "info": info}, run_id="post-fix")
+            # #endregion
+        except Exception as e:
+            logger.warning(f"[{email}] comment-dom failed: {e}")
 
     async def _comment_editor(self):
         """يرجع locator لحقل كتابة التعليق إن وُجد."""
         selectors = [
+            '[data-lexical-editor="true"][contenteditable="true"]',
             '[data-e2e="comment-input"] [contenteditable="true"]',
+            '[data-e2e="comment-input"] [data-lexical-editor="true"]',
             'div[data-e2e="comment-text"] [contenteditable="true"]',
             '[data-e2e="comment-text"]',
             'div[data-e2e="comment-input"] div[contenteditable="true"]',
@@ -916,31 +980,32 @@ class TikTokActions:
             '.DraftEditor-root [contenteditable="true"]',
             '[data-e2e="comment-input"]',
             'div[contenteditable="true"][role="textbox"]',
+            'textarea[placeholder*="comment" i]',
+            'textarea[placeholder*="Add comment" i]',
             'div[contenteditable="true"]',
         ]
         for sel in selectors:
-            loc = self.page.locator(sel).last
             try:
-                if await loc.count() > 0:
-                    # فضّل الظاهر
-                    n = await loc.count()
-                    for i in range(min(n, 5)):
-                        item = self.page.locator(sel).nth(i)
-                        try:
-                            if await item.is_visible():
-                                return item
-                        except Exception:
-                            continue
-                    return loc
+                loc = self.page.locator(sel)
+                n = await loc.count()
+                if n <= 0:
+                    continue
+                for i in range(min(n, 8)):
+                    item = loc.nth(i)
+                    try:
+                        if await item.is_visible():
+                            return item
+                    except Exception:
+                        continue
+                # حتى لو مو visible حسب Playwright، جرّب الأخير
+                return loc.last
             except Exception:
                 continue
-        # JS fallback: أول contenteditable ظاهر داخل منطقة التعليقات
         try:
             handle = await self.page.evaluate_handle(
                 """() => {
-                    const eds = Array.from(document.querySelectorAll('[contenteditable="true"]'));
-                    const vis = eds.find(e => e.offsetParent !== null && e.getClientRects().length);
-                    return vis || null;
+                    const eds = Array.from(document.querySelectorAll('[contenteditable="true"], textarea'));
+                    return eds.reverse().find(e => (e.offsetParent || e.getClientRects().length)) || null;
                 }"""
             )
             el = handle.as_element()
@@ -2309,7 +2374,7 @@ async def run_bot(config: Config = None) -> dict:
         config.proxy_enabled = True
 
     logger.info("=" * 60)
-    logger.info("TikTok Comment Bot - التعليق التلقائي على الفيديوهات")
+    logger.info(f"TikTok Comment Bot | build={BOT_VERSION}")
     logger.info("=" * 60)
     logger.info(f"🎯 الفيديو المستهدف: {config.target_video_url}")
     logger.info(f"👤 بروفايل المراقبة: {config.profile_url}")
