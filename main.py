@@ -855,33 +855,100 @@ class TikTokActions:
     async def open_comments(self, email: str) -> bool:
         logger.info(f"[{email}] فتح قسم التعليقات...")
         await self.dismiss_overlays()
-        input_sel = [
-            'div[data-e2e="comment-input"]',
-            '[data-e2e="comment-input"]',
-            'div.public-DraftEditor-content',
-            'div[contenteditable="true"]',
-        ]
-        if await self.find_first(input_sel, timeout_ms=2500):
+
+        # إذا الحقل ظاهر مسبقاً
+        if await self._comment_editor():
             return True
 
         icon_sel = [
+            '[data-e2e="comment-icon"]',
+            '[data-e2e="browse-comment-icon"]',
             'span[data-e2e="comment-icon"]',
             'div[data-e2e="comment-icon"]',
             'button[data-e2e="comment-icon"]',
-            '[data-e2e="browse-comment-icon"]',
             'strong[data-e2e="comment-count"]',
             'strong[data-e2e="browse-comment-count"]',
+            'button:has-text("Comment")',
+            'div[role="button"]:has-text("Comment")',
         ]
-        btn = await self.find_first(icon_sel, timeout_ms=5000)
+        btn = await self.find_first(icon_sel, timeout_ms=6000)
         if btn:
             try:
                 await btn.click(timeout=4000)
             except Exception:
-                await btn.click(force=True)
-            await asyncio.sleep(2)
-            return True
-        logger.warning(f"[{email}] لم يجد زر أو حقل التعليقات")
-        return False
+                try:
+                    await btn.click(force=True)
+                except Exception:
+                    pass
+            await asyncio.sleep(2.5)
+
+        # محاولة JS كنقر على أيقونة التعليق
+        if not await self._comment_editor():
+            try:
+                await self.page.evaluate(
+                    """() => {
+                        const nodes = Array.from(document.querySelectorAll('[data-e2e*="comment"], button, span, div'));
+                        const hit = nodes.find(n => {
+                          const e = (n.getAttribute('data-e2e')||'');
+                          const t = (n.innerText||'').trim();
+                          return e.includes('comment-icon') || e.includes('comment-count') || /^\\d+$/.test(t) && e.includes('comment');
+                        });
+                        if (hit) hit.click();
+                    }"""
+                )
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+
+        ok = bool(await self._comment_editor())
+        if not ok:
+            logger.warning(f"[{email}] لم يجد زر أو حقل التعليقات")
+        return ok
+
+    async def _comment_editor(self):
+        """يرجع locator لحقل كتابة التعليق إن وُجد."""
+        selectors = [
+            '[data-e2e="comment-input"] [contenteditable="true"]',
+            'div[data-e2e="comment-text"] [contenteditable="true"]',
+            '[data-e2e="comment-text"]',
+            'div[data-e2e="comment-input"] div[contenteditable="true"]',
+            'div.public-DraftEditor-content[contenteditable="true"]',
+            '.DraftEditor-root [contenteditable="true"]',
+            '[data-e2e="comment-input"]',
+            'div[contenteditable="true"][role="textbox"]',
+            'div[contenteditable="true"]',
+        ]
+        for sel in selectors:
+            loc = self.page.locator(sel).last
+            try:
+                if await loc.count() > 0:
+                    # فضّل الظاهر
+                    n = await loc.count()
+                    for i in range(min(n, 5)):
+                        item = self.page.locator(sel).nth(i)
+                        try:
+                            if await item.is_visible():
+                                return item
+                        except Exception:
+                            continue
+                    return loc
+            except Exception:
+                continue
+        # JS fallback: أول contenteditable ظاهر داخل منطقة التعليقات
+        try:
+            handle = await self.page.evaluate_handle(
+                """() => {
+                    const eds = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                    const vis = eds.find(e => e.offsetParent !== null && e.getClientRects().length);
+                    return vis || null;
+                }"""
+            )
+            el = handle.as_element()
+            if el:
+                return el
+        except Exception:
+            pass
+        return None
 
     async def update_video_id(self):
         """Обновляет идентификатор текущего видео, используя URL или другие данные"""
@@ -917,43 +984,71 @@ class TikTokActions:
                 return False
 
             await self.open_comments(email)
-            await asyncio.sleep(1)
+            await asyncio.sleep(1.2)
 
-            # placeholder يعترض النقر — نضغطه مباشرة أو نستخدم force
-            focused = False
-            for sel in [
-                '.public-DraftEditorPlaceholder-inner',
-                'div.public-DraftEditor-content[contenteditable="true"]',
-                'div[data-e2e="comment-input"] div[contenteditable="true"]',
-                'div[data-e2e="comment-input"]',
-                '[data-e2e="comment-input"]',
-            ]:
-                loc = self.page.locator(sel).first
-                try:
-                    await loc.wait_for(state="attached", timeout=4000)
-                    try:
-                        await loc.click(timeout=2500)
-                    except Exception:
-                        await loc.click(force=True, timeout=2500)
-                    focused = True
-                    break
-                except Exception:
-                    continue
-
-            if not focused:
+            editor = await self._comment_editor()
+            if not editor:
+                # #region agent log
+                _dbg("CMT", "main.py:post_comment", "no_editor", {
+                    "email": email,
+                    "url": self.page.url,
+                }, run_id="post-fix")
+                # #endregion
                 logger.error(f"[{email}] لم يجد حقل كتابة التعليق")
                 return False
 
-            await asyncio.sleep(0.4)
-            await self.page.keyboard.press("Control+A")
-            await self.page.keyboard.type(comment_text, delay=50)
+            try:
+                await editor.click(timeout=3000)
+            except Exception:
+                try:
+                    await editor.click(force=True, timeout=3000)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.3)
+
+            # إدخال النص بعدة طرق
+            typed = False
+            try:
+                await editor.fill(comment_text)
+                typed = True
+            except Exception:
+                pass
+            if not typed:
+                try:
+                    await self.page.keyboard.press("Control+A")
+                    await self.page.keyboard.type(comment_text, delay=40)
+                    typed = True
+                except Exception:
+                    pass
+            if not typed:
+                try:
+                    await self.page.evaluate(
+                        """(text) => {
+                            const eds = Array.from(document.querySelectorAll('[contenteditable="true"]'));
+                            const ed = eds.reverse().find(e => e.offsetParent !== null) || eds[eds.length-1];
+                            if (!ed) return false;
+                            ed.focus();
+                            ed.innerText = text;
+                            ed.dispatchEvent(new InputEvent('input', {bubbles:true, data:text}));
+                            return true;
+                        }""",
+                        comment_text,
+                    )
+                    typed = True
+                except Exception as e:
+                    logger.warning(f"[{email}] فشل إدخال نص التعليق: {e}")
+                    return False
+
             await asyncio.sleep(self.config.action_delay)
 
             posted = False
             for sel in [
-                'div[data-e2e="comment-post"]',
                 '[data-e2e="comment-post"]',
+                'div[data-e2e="comment-post"]',
                 'button[data-e2e="comment-post"]',
+                'button:has-text("Post")',
+                'div[role="button"]:has-text("Post")',
+                'button:has-text("نشر")',
             ]:
                 btn = self.page.locator(sel).first
                 try:
@@ -965,6 +1060,12 @@ class TikTokActions:
                     continue
             if not posted:
                 await self.page.keyboard.press("Enter")
+                await asyncio.sleep(0.3)
+                # أحياناً Enter وحده ما يكفي — Ctrl+Enter
+                try:
+                    await self.page.keyboard.press("Control+Enter")
+                except Exception:
+                    pass
             await asyncio.sleep(self.config.comment_delay)
 
             await self.stats.increment('comments')
@@ -972,6 +1073,13 @@ class TikTokActions:
                                                                                    'comments_per_video'].get(
                 self.current_video_id, 0) + 1
 
+            # #region agent log
+            _dbg("CMT", "main.py:post_comment", "posted", {
+                "email": email,
+                "text_len": len(comment_text),
+                "posted_btn": posted,
+            }, run_id="post-fix")
+            # #endregion
             logger.success(f"[{email}] تم نشر التعليق: {comment_text}")
             return True
         except Exception as e:
@@ -1862,7 +1970,9 @@ class TikTokChecker:
                     context_kwargs = dict(self.config.browser_context_options)
 
                     use_session = False
-                    if self.config.force_relogin:
+                    # على VPS مع بروكسي: الجلسات من اللوكل غالباً تسبب مشاكل
+                    force = bool(self.config.force_relogin)
+                    if force:
                         if os.path.exists(session_file):
                             try:
                                 os.remove(session_file)
