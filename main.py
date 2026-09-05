@@ -255,14 +255,25 @@ class Config:
         '--disable-setuid-sandbox',
         '--disable-infobars',
         '--disable-default-apps',
-        '--no-first-run'
+        '--no-first-run',
+        '--disable-blink-features=AutomationControlled',
     ])
 
     # Настройки контекста браузера
     browser_context_options: Dict[str, Any] = field(default_factory=lambda: {
-        'viewport': {'width': 1260, 'height': 700},
+        'viewport': {'width': 1280, 'height': 800},
         'ignore_https_errors': True,
         'java_script_enabled': True,
+        'locale': 'en-US',
+        'timezone_id': 'America/New_York',
+        'user_agent': (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/131.0.0.0 Safari/537.36"
+        ),
+        'extra_http_headers': {
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
     })
 
     @classmethod
@@ -1417,6 +1428,86 @@ class TikTokChecker:
             await asyncio.sleep(3)
             return "tiktok.com" in (page.url or "")
 
+    @staticmethod
+    def clean_tiktok_url(url: str) -> str:
+        """يشيل query/hash من رابط تيك توك."""
+        url = (url or "").strip()
+        if not url:
+            return url
+        return url.split("?")[0].split("#")[0].rstrip("/")
+
+    def extract_video_id(self, url: str) -> Optional[str]:
+        m = re.search(r"/video/(\d+)", url or "")
+        return m.group(1) if m else None
+
+    async def open_target_video(self, page: Page, email: str, target: str) -> bool:
+        """يفتح فيديو مستهدف مع تجاوز تحويلات /about الشائعة على VPS."""
+        target = self.clean_tiktok_url(target)
+        vid = self.extract_video_id(target)
+        username_m = re.search(r"tiktok\.com/@([^/?]+)", target or "", re.IGNORECASE)
+        username = username_m.group(1) if username_m else None
+
+        # #region agent log
+        _dbg("NAV", "main.py:open_target_video", "nav_start", {
+            "email": email,
+            "target": target,
+            "vid": vid,
+            "username": username,
+        }, run_id="post-fix")
+        # #endregion
+
+        # محاولة 1: رابط الفيديو المباشر النظيف
+        await self.safe_goto(page, target, email)
+        await asyncio.sleep(2)
+        if "/video/" in (page.url or "") and "about" not in (page.url or ""):
+            # #region agent log
+            _dbg("NAV", "main.py:open_target_video", "nav_ok_direct", {"url": page.url}, run_id="post-fix")
+            # #endregion
+            return True
+
+        logger.warning(f"[{email}] تحويل غير متوقع بعد رابط مباشر: {page.url} — محاولة عبر البروفايل")
+
+        # محاولة 2: افتح البروفايل ثم اضغط على نفس الفيديو
+        if username and vid:
+            profile = f"https://www.tiktok.com/@{username}"
+            await self.safe_goto(page, profile, email)
+            await asyncio.sleep(2)
+            # #region agent log
+            _dbg("NAV", "main.py:open_target_video", "profile_page", {"url": page.url}, run_id="post-fix")
+            # #endregion
+            if "about" in (page.url or "") and "/@" not in (page.url or ""):
+                logger.error(f"[{email}] تيك توك حجب الوصول (about page). غالباً IP السيرفر محظور.")
+                return False
+
+            link = page.locator(f'a[href*="/video/{vid}"]').first
+            if await link.count() > 0:
+                try:
+                    await link.click(timeout=8000)
+                except Exception:
+                    href = await link.get_attribute("href")
+                    if href:
+                        if not href.startswith("http"):
+                            href = "https://www.tiktok.com" + href
+                        await self.safe_goto(page, self.clean_tiktok_url(href), email)
+                await asyncio.sleep(3)
+                if "/video/" in (page.url or ""):
+                    # #region agent log
+                    _dbg("NAV", "main.py:open_target_video", "nav_ok_profile_click", {"url": page.url}, run_id="post-fix")
+                    # #endregion
+                    return True
+
+            # محاولة 3: goto مباشر من البروفايل مرة ثانية
+            await self.safe_goto(page, target, email)
+            await asyncio.sleep(2)
+            if "/video/" in (page.url or ""):
+                return True
+
+        # #region agent log
+        _dbg("NAV", "main.py:open_target_video", "nav_failed", {"url": page.url}, run_id="post-fix")
+        # #endregion
+        logger.error(f"[{email}] فشل فتح الفيديو. الصفحة النهائية: {page.url}")
+        return False
+
     async def is_logged_in(self, page: Page) -> bool:
         """يتحقق إذا المستخدم مسجّل دخول فعلاً."""
         url = page.url or ""
@@ -1791,7 +1882,7 @@ class TikTokChecker:
                         return True
 
                     # ===== وضع التعليق على فيديو محدد =====
-                    target = self.config.target_video_url.strip()
+                    target = self.clean_tiktok_url(self.config.target_video_url.strip())
                     is_short = any(x in target for x in ["vm.tiktok.com", "vt.tiktok.com", "/t/"])
                     is_video = "/video/" in target or is_short
                     is_profile = not is_video
@@ -1809,21 +1900,19 @@ class TikTokChecker:
                             href = await first_video.get_attribute("href")
                             if href and not href.startswith("http"):
                                 href = "https://www.tiktok.com" + href
+                            href = self.clean_tiktok_url(href)
                             logger.info(f"[{email}] وجد أول فيديو: {href}")
-                            await self.safe_goto(page, href, email)
+                            opened = await self.open_target_video(page, email, href)
                         else:
                             logger.warning(f"[{email}] لم يجد فيديو على البروفايل، سيحاول النقر على أول مقطع...")
                             video_thumb = page.locator('div[data-e2e="user-post-item"] a').first
                             if await video_thumb.count() > 0:
                                 await video_thumb.click()
                                 await asyncio.sleep(4)
+                            opened = "/video/" in (page.url or "")
                     else:
                         logger.info(f"[{email}] الانتقال إلى الفيديو المستهدف: {target}")
-                        await self.safe_goto(page, target, email)
-                        for _ in range(20):
-                            if "/video/" in page.url:
-                                break
-                            await asyncio.sleep(0.5)
+                        opened = await self.open_target_video(page, email, target)
                         logger.info(f"[{email}] بعد التحويل: {page.url}")
 
                     # حل الكابتشا لو ظهرت بعد التنقل
@@ -1840,8 +1929,15 @@ class TikTokChecker:
 
                     logger.info(f"[{email}] الصفحة الحالية: {page.url}")
 
-                    if "/video/" not in page.url:
-                        logger.warning(f"[{email}] لم يصل لصفحة فيديو بعد — سيحاول المتابعة على أي حال")
+                    if not opened or "/video/" not in page.url:
+                        logger.error(
+                            f"[{email}] لم نصل لصفحة الفيديو (حظر/تحويل). "
+                            f"جرّب Proxy سكني أو عطّل Headless. URL={page.url}"
+                        )
+                        await self.stats.increment('failed')
+                        await context.close()
+                        await unregister_browser(browser)
+                        return False
 
                     # Сохранение информации об аккаунте
                     success = self.file_handler.save_account(email, password, [])
