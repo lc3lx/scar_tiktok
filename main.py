@@ -67,6 +67,15 @@ async def launch_browser(playwright, config: "Config"):
         "headless": config.browser_headless,
         "args": list(config.browser_args),
     }
+    proxy_cfg = None
+    if getattr(config, "proxy_enabled", False) and getattr(config, "proxy", ""):
+        proxy_cfg = parse_proxy(config.proxy)
+        if proxy_cfg:
+            kwargs["proxy"] = proxy_cfg
+            logger.info(f"استخدام بروكسي: {proxy_cfg.get('server')} (user={'نعم' if proxy_cfg.get('username') else 'لا'})")
+        else:
+            logger.warning("صيغة البروكسي غير صحيحة — سيتم التشغيل بدون بروكسي")
+
     edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
     if os.path.exists(edge):
@@ -151,6 +160,41 @@ def resolve_mailbox(mailbox_email: str) -> Optional[Dict]:
     return None
 
 
+def parse_proxy(raw: str) -> Optional[Dict[str, str]]:
+    """يفهم صيغ: host:port:user:pass أو http://user:pass@host:port أو host:port"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if "://" in raw:
+        # http://user:pass@host:port
+        try:
+            from urllib.parse import urlparse
+            u = urlparse(raw)
+            if not u.hostname or not u.port:
+                return None
+            out = {"server": f"{u.scheme}://{u.hostname}:{u.port}"}
+            if u.username:
+                out["username"] = u.username
+            if u.password:
+                out["password"] = u.password
+            return out
+        except Exception:
+            return None
+    parts = raw.split(":")
+    if len(parts) == 2:
+        host, port = parts
+        return {"server": f"http://{host}:{port}"}
+    if len(parts) >= 4:
+        host, port, user = parts[0], parts[1], parts[2]
+        password = ":".join(parts[3:])  # password قد يحتوي :
+        return {
+            "server": f"http://{host}:{port}",
+            "username": user,
+            "password": password,
+        }
+    return None
+
+
 def load_settings() -> dict:
     defaults = {
         "target_video_url": "",
@@ -170,6 +214,8 @@ def load_settings() -> dict:
         "auto_otp": True,
         "dashboard_host": "0.0.0.0",
         "dashboard_port": 5050,
+        "proxy_enabled": False,
+        "proxy": "",  # host:port:user:pass
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -216,6 +262,8 @@ class Config:
     max_browsers: int = 2
     browser_headless: bool = False
     max_check_attempts: int = 1
+    proxy_enabled: bool = False
+    proxy: str = ""  # host:port:user:pass
 
     # Таймауты (в секундах)
     page_timeout: int = 45
@@ -298,6 +346,8 @@ class Config:
         cfg.watch_count = int(s.get("watch_count", 0))
         cfg.max_browsers = int(s.get("max_browsers", 2))
         cfg.browser_headless = bool(s.get("browser_headless", False))
+        cfg.proxy_enabled = bool(s.get("proxy_enabled", False))
+        cfg.proxy = (s.get("proxy") or "").strip()
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = s.get("imap_host", cfg.imap_host)
         cfg.imap_port = int(s.get("imap_port", 993))

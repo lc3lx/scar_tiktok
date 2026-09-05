@@ -146,6 +146,8 @@ def api_settings():
         "watch_count": int(data.get("watch_count", 0) or 0),
         "max_browsers": max(1, int(data.get("max_browsers", 1) or 1)),
         "browser_headless": bool(data.get("browser_headless", True)),
+        "proxy_enabled": bool(data.get("proxy_enabled", False)),
+        "proxy": (data.get("proxy") or "").strip(),
         "auto_otp": bool(data.get("auto_otp", True)),
         "imap_host": (data.get("imap_host") or "imap.hostinger.com").strip(),
         "imap_port": int(data.get("imap_port", 993) or 993),
