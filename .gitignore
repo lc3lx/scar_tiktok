@@ -1,0 +1,23 @@
+# Secrets & local data
+accounts.json
+mailboxes.json
+acc.txt
+accounts/
+*.session.json
+.env
+.env.*
+
+# Logs & cache
+__pycache__/
+*.pyc
+*.pyo
+*.log
+debug-*.log
+.pytest_cache/
+.mypy_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

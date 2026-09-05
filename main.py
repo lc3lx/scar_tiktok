@@ -1,12 +1,123 @@
 import asyncio
+import json
 import os
-from dataclasses import dataclass, field
+import re
+import time
+from dataclasses import dataclass, field, asdict
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from loguru import logger
 from playwright.async_api import async_playwright, Page
-from playwright_stealth import stealth_async, StealthConfig
+from playwright_stealth import Stealth
 from tiktok_captcha_solver import AsyncPlaywrightSolver
+
+from email_otp import wait_for_otp
+from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
+
+# #region agent log
+_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
+
+STOP_BOT_FLAG = False
+
+def _dbg(hypothesis_id: str, location: str, message: str, data: dict = None, run_id: str = "pre-fix"):
+    try:
+        import json as _json
+        import time as _time
+        payload = {
+            "sessionId": "8e9bfe",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(_time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as _f:
+            _f.write(_json.dumps(payload, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+# #endregion
+
+SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
+ACCOUNTS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.json")
+MAILBOXES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mailboxes.json")
+
+
+def load_mailboxes() -> List[Dict]:
+    if not os.path.exists(MAILBOXES_FILE):
+        return []
+    try:
+        with open(MAILBOXES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"فشل قراءة mailboxes.json: {e}")
+        return []
+
+
+def save_mailboxes(mailboxes: List[Dict]) -> None:
+    with open(MAILBOXES_FILE, "w", encoding="utf-8") as f:
+        json.dump(mailboxes, f, ensure_ascii=False, indent=2)
+
+
+def load_accounts_json() -> List[Dict]:
+    if not os.path.exists(ACCOUNTS_FILE):
+        return []
+    try:
+        with open(ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"فشل قراءة accounts.json: {e}")
+        return []
+
+
+def save_accounts_json(accounts: List[Dict]) -> None:
+    with open(ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(accounts, f, ensure_ascii=False, indent=2)
+
+
+def resolve_mailbox(mailbox_email: str) -> Optional[Dict]:
+    mailbox_email = (mailbox_email or "").strip().lower()
+    for m in load_mailboxes():
+        if (m.get("email") or "").strip().lower() == mailbox_email:
+            return m
+    return None
+
+
+def load_settings() -> dict:
+    defaults = {
+        "target_video_url": "",
+        "profile_url": "https://www.tiktok.com/@scaralphaai",
+        "bot_mode": "watch",  # comment | watch
+        "comment_texts": ["بطل", "وحش"],
+        "comment_all_in_order": True,
+        "enable_liking": True,
+        "enable_commenting": True,
+        "enable_sharing": True,
+        "watch_count": 0,  # 0 = لا نهائي
+        "max_browsers": 2,
+        "browser_headless": False,
+        "imap_host": "imap.hostinger.com",
+        "imap_port": 993,
+        "otp_timeout": 90,
+        "auto_otp": True,
+    }
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            defaults.update(data)
+        except Exception as e:
+            logger.warning(f"فشل قراءة settings.json: {e}")
+    return defaults
+
+
+def save_settings(data: dict) -> None:
+    current = load_settings()
+    current.update(data)
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(current, f, ensure_ascii=False, indent=2)
 
 
 @dataclass
@@ -14,54 +125,67 @@ class Config:
     """Класс для управления настройками скрипта"""
     sadcaptcha_api_key: str = "SADCAPCHA_API_KEY"
 
+    # ===== إعدادات الفيديو المستهدف =====
+    target_video_url: str = "https://www.tiktok.com/@scaralphaai/video/7680704444190821654"
+    # رابط بروفايل الشخص للمراقبة المستمرة
+    profile_url: str = "https://www.tiktok.com/@scaralphaai"
+    # comment = تعليق على فيديو محدد | watch = مشاهدة وقلب فيديوهات الحساب
+    bot_mode: str = "watch"
+
+    # ===== قائمة التعليقات =====
+    comment_all_in_order: bool = True
+    comment_texts: List[str] = field(default_factory=lambda: [
+        "بطل",
+        "وحش",
+    ])
+
     # Пути к файлам
     accounts_filename: str = "acc.txt"
     output_dir: str = "accounts"
     log_filename: str = "tiktok_checker.log"
 
     # Параметры браузера
-    max_browsers: int = 10
+    max_browsers: int = 2
     browser_headless: bool = False
     max_check_attempts: int = 1
 
     # Таймауты (в секундах)
-    page_timeout: int = 3
-    action_delay: float = 0.5
-    comment_delay: float = 1.0
+    page_timeout: int = 45
+    action_delay: float = 1.0
+    comment_delay: float = 2.0
 
     # Включение/отключение действий
     enable_commenting: bool = True
-    enable_reply_commenting: bool = True
+    enable_reply_commenting: bool = False
     enable_liking: bool = True
+    enable_sharing: bool = True
     enable_next_video: bool = True
 
-    # Настройки спама комментариями
-    enable_comment_loop: bool = True  # Включить циклическое комментирование
-    comment_loop_count: int = 0  # 0 = бесконечный цикл, >0 = определенное количество циклов
-    comment_loop_delay: int = 1  # Задержка между циклами комментирования (секунды)
+    # مشاهدة مستمرة: 0 = لا نهائي
+    watch_count: int = 0
 
-    # Содержание комментариев
-    comment_text: str = "Мальчики, оцените историю😅🍑"
-    comment_texts: List[str] = field(default_factory=list)
+    enable_comment_loop: bool = False
+    comment_loop_count: int = 1
+    comment_loop_delay: int = 3
 
-    # Режим "висения" после успешного входа
-    enable_hanging: bool = True
-    hang_check_interval: int = 60  # секунды между проверками в режиме висения
+    comment_text: str = "🔥🔥🔥"
+
+    enable_hanging: bool = False
+    hang_check_interval: int = 60
+
+    # Hostinger IMAP OTP
+    auto_otp: bool = True
+    imap_host: str = "imap.hostinger.com"
+    imap_port: int = 993
+    otp_timeout: int = 90
 
     # Аргументы для запуска браузера
     browser_args: List[str] = field(default_factory=lambda: [
         '--no-sandbox',
-        '--disable-gpu',
         '--disable-dev-shm-usage',
         '--disable-extensions',
         '--disable-setuid-sandbox',
         '--disable-infobars',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-site-isolation-trials',
-        '--ignore-certificate-errors',
-        '--disable-accelerated-2d-canvas',
-        '--disable-browser-side-navigation',
         '--disable-default-apps',
         '--no-first-run'
     ])
@@ -69,17 +193,37 @@ class Config:
     # Настройки контекста браузера
     browser_context_options: Dict[str, Any] = field(default_factory=lambda: {
         'viewport': {'width': 1260, 'height': 700},
-        'user_agent': "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         'ignore_https_errors': True,
         'java_script_enabled': True,
     })
 
-    # Настройки для stealth-режима
-    stealth_config: Dict[str, bool] = field(default_factory=lambda: {
-        'navigator_languages': False,
-        'navigator_vendor': False,
-        'navigator_user_agent': False
-    })
+    @classmethod
+    def from_settings(cls) -> "Config":
+        s = load_settings()
+        cfg = cls()
+        cfg.target_video_url = s.get("target_video_url", cfg.target_video_url)
+        cfg.profile_url = s.get("profile_url", cfg.profile_url)
+        # لو profile فاضي أو رابط فيديو ناقص — استخرج الحساب من target_video_url
+        raw_profile = (cfg.profile_url or "").strip()
+        raw_video = (cfg.target_video_url or "").strip()
+        m = re.search(r"tiktok\.com/@([^/?]+)", raw_profile or raw_video or "", re.IGNORECASE)
+        if m:
+            cfg.profile_url = f"https://www.tiktok.com/@{m.group(1)}"
+        cfg.bot_mode = s.get("bot_mode", cfg.bot_mode)
+        cfg.comment_texts = s.get("comment_texts", cfg.comment_texts) or cfg.comment_texts
+        migrate_from_settings(cfg.comment_texts)
+        cfg.comment_all_in_order = bool(s.get("comment_all_in_order", True))
+        cfg.enable_liking = bool(s.get("enable_liking", True))
+        cfg.enable_commenting = bool(s.get("enable_commenting", True))
+        cfg.enable_sharing = bool(s.get("enable_sharing", True))
+        cfg.watch_count = int(s.get("watch_count", 0))
+        cfg.max_browsers = int(s.get("max_browsers", 2))
+        cfg.browser_headless = bool(s.get("browser_headless", False))
+        cfg.auto_otp = bool(s.get("auto_otp", True))
+        cfg.imap_host = s.get("imap_host", cfg.imap_host)
+        cfg.imap_port = int(s.get("imap_port", 993))
+        cfg.otp_timeout = int(s.get("otp_timeout", 90))
+        return cfg
 
 
 class Stats:
@@ -95,6 +239,8 @@ class Stats:
             'comments': 0,
             'replies': 0,
             'likes': 0,
+            'shares': 0,
+            'watched': 0,
             'next_videos': 0,
             'comment_loops': 0,  # Количество выполненных циклов комментирования
             'comments_per_video': {},  # Статистика по комментариям на каждое видео
@@ -118,11 +264,13 @@ class Stats:
             report += f"Неуспешно: {self.counters['failed']} | "
             report += f"Ошибки: {self.counters['errors']}\n"
 
-            if any(self.counters.get(k, 0) > 0 for k in ['comments', 'replies', 'likes', 'next_videos']):
+            if any(self.counters.get(k, 0) > 0 for k in ['comments', 'replies', 'likes', 'next_videos', 'shares', 'watched']):
                 report += f"Действия: "
                 report += f"Комментарии: {self.counters.get('comments', 0)} | "
                 report += f"Ответы: {self.counters.get('replies', 0)} | "
                 report += f"Лайки: {self.counters.get('likes', 0)} | "
+                report += f"شير: {self.counters.get('shares', 0)} | "
+                report += f"مشاهدات: {self.counters.get('watched', 0)} | "
                 report += f"Переходы: {self.counters.get('next_videos', 0)}"
 
             if self.counters.get('comment_loops', 0) > 0:
@@ -160,19 +308,77 @@ class FileHandler:
             return False
 
     def read_accounts(self) -> List[Dict]:
-        """Читает учетные данные из файла"""
+        """يقرأ الحسابات من accounts.json (مع ربط Hostinger) أو acc.txt كاحتياط."""
         accounts = []
+        mailboxes = { (m.get("email") or "").lower(): m for m in load_mailboxes() }
+
+        json_accounts = load_accounts_json()
+        if json_accounts:
+            for item in json_accounts:
+                email = (item.get("email") or "").strip()
+                password = (item.get("password") or "").strip()
+                if not email or not password:
+                    continue
+                mailbox_email = (item.get("mailbox") or "").strip().lower()
+                mailbox = mailboxes.get(mailbox_email) if mailbox_email else None
+                if not mailbox and len(mailboxes) == 1:
+                    # لو في صندوق واحد فقط، استخدمه تلقائياً
+                    mailbox = next(iter(mailboxes.values()))
+                    mailbox_email = mailbox.get("email", "")
+                accounts.append({
+                    "email": email,
+                    "password": password,
+                    "mailbox": mailbox_email or (mailbox or {}).get("email", ""),
+                    "mailbox_email": (mailbox or {}).get("email", mailbox_email),
+                    "email_password": (mailbox or {}).get("password") or password,
+                })
+            logger.info(f"تم تحميل {len(accounts)} حساب من accounts.json")
+            return accounts
+
+        # توافق مع acc.txt القديم
         try:
             with open(self.config.accounts_filename, 'r', encoding='utf-8') as f:
                 for line in f:
                     line = line.strip()
-                    if ':' in line:
-                        email, password = line.split(':', 1)
-                        accounts.append({'email': email, 'password': password})
+                    if not line or line.startswith('#') or ':' not in line:
+                        continue
+                    parts = line.split(':')
+                    email = parts[0]
+                    if len(parts) >= 3:
+                        email_password = parts[-1]
+                        password = ':'.join(parts[1:-1])
+                    else:
+                        password = parts[1]
+                        email_password = password
+                    # لو في mailbox افتراضي
+                    if mailboxes and len(mailboxes) == 1:
+                        mb = next(iter(mailboxes.values()))
+                        accounts.append({
+                            "email": email,
+                            "password": password,
+                            "mailbox": mb.get("email", ""),
+                            "mailbox_email": mb.get("email", ""),
+                            "email_password": mb.get("password") or email_password,
+                        })
+                    else:
+                        accounts.append({
+                            "email": email,
+                            "password": password,
+                            "mailbox": email,
+                            "mailbox_email": email,
+                            "email_password": email_password,
+                        })
             logger.info(f"Загружено {len(accounts)} аккаунтов из {self.config.accounts_filename}")
         except Exception as e:
-            logger.error(f"Ошибка чтения аккаунтов из {self.config.accounts_filename}: {type(e).__name__}: {str(e)}")
+            logger.error(f"Ошибка чтения аккаунтов: {type(e).__name__}: {str(e)}")
         return accounts
+
+    def session_path(self, email: str) -> str:
+        safe = email.replace(':', '_').replace('@', '_at_')
+        return os.path.join(self.config.output_dir, f"{safe}_session.json")
+
+    def has_session(self, email: str) -> bool:
+        return os.path.exists(self.session_path(email))
 
 
 class TikTokActions:
@@ -186,11 +392,364 @@ class TikTokActions:
         import random
         self.random = random
 
-    def get_comment_text(self) -> str:
-        """Возвращает текст комментария, случайно выбирая из списка, если он есть"""
-        if self.config.comment_texts:
-            return self.random.choice(self.config.comment_texts)
-        return self.config.comment_text
+    def get_comment_text(self, account_email: str = "") -> Optional[str]:
+        """يأخذ تعليقاً من المجمع ويحذفه حتى لا يستخدمه حساب آخر."""
+        text = take_comment(account_email or "")
+        if text:
+            return text
+        logger.warning(f"[{account_email}] مجمع التعليقات فارغ")
+        return None
+
+    async def find_first(self, selectors: List[str], timeout_ms: int = 8000):
+        for sel in selectors:
+            loc = self.page.locator(sel).first
+            try:
+                if await loc.count() > 0 and await loc.is_visible():
+                    return loc
+            except Exception:
+                continue
+        for sel in selectors:
+            loc = self.page.locator(sel).first
+            try:
+                await loc.wait_for(state="visible", timeout=timeout_ms)
+                return loc
+            except Exception:
+                continue
+        return None
+
+    async def dismiss_overlays(self):
+        for sel in [
+            'button[data-e2e="modal-close-inner-button"]',
+            'button[aria-label="Close"]',
+            '[data-e2e="browse-close"]',
+            'div[class*="DivCloseWrapper"]',
+            'button:has-text("Refresh")',
+            'button:has-text("Try again")',
+            'button:has-text("OK")',
+            'button:has-text("Got it")',
+            'button:has-text("Continue")',
+            'div[role="button"]:has-text("Refresh")',
+        ]:
+            try:
+                loc = self.page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    await loc.click(timeout=1500)
+                    await asyncio.sleep(0.5)
+            except Exception:
+                continue
+        # أغلق أي dialog بنص refresh
+        try:
+            await self.page.evaluate(
+                """() => {
+                    const btns = Array.from(document.querySelectorAll('button, div[role="button"]'));
+                    const hit = btns.find(b => /refresh|try again|reload|ok|got it/i.test((b.innerText||'').trim()));
+                    if (hit) hit.click();
+                }"""
+            )
+        except Exception:
+            pass
+
+    async def has_playback_error(self) -> bool:
+        try:
+            body = await self.page.inner_text("body")
+            # #region agent log
+            snippet = ""
+            for pat in ("trouble playing", "Please refresh", "try again", "We're having"):
+                i = body.lower().find(pat.lower())
+                if i >= 0:
+                    snippet = body[max(0, i - 40): i + 80].replace("\n", " ")
+                    break
+            matched = bool(re.search(
+                r"trouble playing|Please refresh|try again|can't play|unable to play|تعذر|حدّث|حدث خطأ",
+                body,
+                re.IGNORECASE,
+            ))
+            _dbg("A", "main.py:has_playback_error", "playback_error_scan", {
+                "matched": matched,
+                "snippet": snippet[:160],
+                "body_len": len(body),
+                "url": self.page.url,
+            })
+            # #endregion
+            return matched
+        except Exception as e:
+            # #region agent log
+            _dbg("A", "main.py:has_playback_error", "playback_error_exception", {"error": str(e)})
+            # #endregion
+            return False
+
+    async def ensure_video_plays(self, email: str, video_url: str = None, max_retries: int = 3) -> bool:
+        """يفتح/يشغّل الفيديو ويعمل refresh لو ظهر خطأ التشغيل."""
+        for attempt in range(1, max_retries + 1):
+            await self.dismiss_overlays()
+
+            # #region agent log
+            vid_meta = await self.page.evaluate(
+                """() => {
+                    const vids = Array.from(document.querySelectorAll('video'));
+                    return {
+                        count: vids.length,
+                        infos: vids.slice(0,3).map(v => ({
+                            paused: v.paused,
+                            readyState: v.readyState,
+                            networkState: v.networkState,
+                            currentTime: v.currentTime,
+                            duration: v.duration || 0,
+                            src: (v.currentSrc || v.src || '').slice(0,120),
+                            error: v.error ? v.error.code : null,
+                            width: v.videoWidth,
+                            height: v.videoHeight
+                        }))
+                    };
+                }"""
+            )
+            _dbg("B", "main.py:ensure_video_plays", "pre_attempt_video_meta", {
+                "attempt": attempt,
+                "email": email,
+                "url": self.page.url,
+                "video_meta": vid_meta,
+            })
+            # #endregion
+
+            if await self.has_playback_error():
+                logger.warning(f"[{email}] خطأ تشغيل الفيديو — refresh محاولة {attempt}/{max_retries}")
+                if video_url:
+                    await self.page.goto(video_url, wait_until="domcontentloaded", timeout=45000)
+                else:
+                    await self.page.reload(wait_until="domcontentloaded", timeout=45000)
+                await asyncio.sleep(4)
+                await self.dismiss_overlays()
+
+            ok = await self.play_video(email)
+            await asyncio.sleep(2)
+
+            # تحقق إن الفيديو فعلاً يتقدم
+            progress = await self.page.evaluate(
+                """async () => {
+                    const v = document.querySelector('video');
+                    if (!v) return {ok:false, reason:'no-video'};
+                    let playErr = null;
+                    try { v.muted = true; await v.play(); } catch(e) { playErr = String(e); }
+                    const t1 = v.currentTime || 0;
+                    await new Promise(r => setTimeout(r, 1500));
+                    const t2 = v.currentTime || 0;
+                    return {
+                        ok: !v.paused && (t2 > t1 || t2 > 0.2),
+                        paused: v.paused,
+                        t1, t2,
+                        dur: v.duration || 0,
+                        readyState: v.readyState,
+                        networkState: v.networkState,
+                        error: v.error ? v.error.code : null,
+                        playErr,
+                        src: (v.currentSrc || v.src || '').slice(0,120)
+                    };
+                }"""
+            )
+            err_after = await self.has_playback_error()
+            # #region agent log
+            _dbg("D", "main.py:ensure_video_plays", "progress_check", {
+                "attempt": attempt,
+                "play_video_ok": ok,
+                "progress": progress,
+                "error_after": err_after,
+            })
+            # #endregion
+            if progress and progress.get("ok") and not err_after:
+                logger.success(f"[{email}] تشغيل مؤكد (t={progress.get('t2'):.1f})")
+                return True
+
+            logger.warning(f"[{email}] التشغيل غير مؤكد — إعادة تحميل ({attempt}/{max_retries})")
+            if video_url:
+                await self.page.goto(video_url, wait_until="domcontentloaded", timeout=45000)
+            else:
+                await self.page.reload(wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(3)
+
+        # #region agent log
+        _dbg("C", "main.py:ensure_video_plays", "all_retries_failed", {
+            "email": email,
+            "url": self.page.url,
+            "video_url": video_url,
+        })
+        # #endregion
+        return False
+
+    async def play_video(self, email: str) -> bool:
+        logger.info(f"[{email}] تشغيل الفيديو...")
+        try:
+            await self.dismiss_overlays()
+            if await self.has_playback_error():
+                logger.warning(f"[{email}] رسالة refresh ظاهرة قبل التشغيل")
+                # #region agent log
+                _dbg("A", "main.py:play_video", "abort_due_playback_error_banner", {"url": self.page.url})
+                # #endregion
+                return False
+
+            video = self.page.locator("video").first
+            await video.wait_for(state="attached", timeout=20000)
+
+            for i in range(4):
+                await self.dismiss_overlays()
+                try:
+                    await video.click(force=True, timeout=2000)
+                except Exception:
+                    pass
+                playing = await self.page.evaluate(
+                    """async () => {
+                        const v = document.querySelector('video');
+                        if (!v) return {ok:false, reason:'no-video'};
+                        try {
+                            v.playsInline = true;
+                            v.currentTime = Math.max(v.currentTime, 0);
+                            await v.play();
+                            // Attempt to unmute if playing
+                            try { v.muted = false; } catch(e) {}
+                            
+                            // Scroll a bit to simulate human behavior
+                            window.scrollBy(0, 100);
+                            setTimeout(() => window.scrollBy(0, -100), 1000);
+                            
+                            return {ok: !v.paused, paused: v.paused, muted: v.muted, readyState: v.readyState, error: v.error ? v.error.code : null, src:(v.currentSrc||v.src||'').slice(0,80)};
+                        } catch (e) {
+                            try { v.muted = true; await v.play(); return {ok:!v.paused, muted: v.muted, playCatch:String(e)}; } catch(e2) { return {ok:false, playCatch:String(e), playCatch2:String(e2)}; }
+                        }
+                    }"""
+                )
+                # #region agent log
+                _dbg("B", "main.py:play_video", "play_attempt", {"i": i, "playing": playing})
+                # #endregion
+                ok_flag = playing.get("ok") if isinstance(playing, dict) else bool(playing)
+                if ok_flag and not await self.has_playback_error():
+                    logger.success(f"[{email}] الفيديو شغال فعلياً")
+                    return True
+                await asyncio.sleep(1)
+
+            try:
+                await self.page.keyboard.press("Space")
+                await asyncio.sleep(0.8)
+            except Exception:
+                pass
+            return not await self.has_playback_error()
+        except Exception as e:
+            logger.warning(f"[{email}] تعذر تشغيل الفيديو: {type(e).__name__}: {e}")
+            # #region agent log
+            _dbg("E", "main.py:play_video", "play_exception", {"error": f"{type(e).__name__}: {e}"})
+            # #endregion
+            return False
+
+    async def like_video(self, email: str, target_username: str = None) -> bool:
+        """لايك فقط على فيديو الحساب المستهدف."""
+        if not self.config.enable_liking:
+            return False
+        if target_username and not self.is_target_creator_video(target_username):
+            logger.warning(f"[{email}] تخطي لايك — مو فيديو @{target_username}")
+            return False
+
+        try:
+            # أزرار اللايك بجانب المشغّل فقط (مو You may like)
+            like_btn = await self.find_first([
+                'div[class*="DivActionItemContainer"] strong[data-e2e="like-count"]',
+                'div[class*="DivActionItemContainer"] [data-e2e="like-icon"]',
+                'strong[data-e2e="browse-like-count"]',
+                'strong[data-e2e="like-count"]',
+                '[data-e2e="browse-like-icon"]',
+                '[data-e2e="like-icon"]',
+            ], timeout_ms=6000)
+
+            if like_btn:
+                await like_btn.click(force=True)
+                await asyncio.sleep(self.config.action_delay)
+                logger.success(f"[{email}] لايك على @{target_username or 'الفيديو'}")
+                await self.stats.increment('likes')
+                return True
+
+            logger.warning(f"[{email}] لم يجد زر اللايك")
+            return False
+        except Exception as e:
+            logger.error(f"خطأ لايك: {type(e).__name__}: {e}")
+            return False
+
+    async def share_video(self, email: str, target_username: str = None) -> bool:
+        """شير فقط على فيديو الحساب المستهدف."""
+        if not self.config.enable_sharing:
+            return False
+        if target_username and not self.is_target_creator_video(target_username):
+            logger.warning(f"[{email}] تخطي شير — مو فيديو @{target_username}")
+            return False
+        try:
+            await self.dismiss_overlays()
+            share_btn = await self.find_first([
+                'div[class*="DivActionItemContainer"] [data-e2e="share-icon"]',
+                '[data-e2e="share-icon"]',
+                '[data-e2e="browse-share-icon"]',
+                'strong[data-e2e="share-count"]',
+                'strong[data-e2e="browse-share-count"]',
+            ], timeout_ms=6000)
+            if not share_btn:
+                logger.warning(f"[{email}] لم يجد زر الشير")
+                return False
+
+            await share_btn.click(force=True)
+            await asyncio.sleep(1.2)
+
+            copied = False
+            for sel in [
+                'button:has-text("Copy link")',
+                '[data-e2e="share-copy-link"]',
+                'div[role="button"]:has-text("Copy link")',
+                'button:has-text("نسخ الرابط")',
+            ]:
+                opt = self.page.locator(sel).first
+                try:
+                    if await opt.count() > 0 and await opt.is_visible():
+                        await opt.click(force=True)
+                        copied = True
+                        await asyncio.sleep(0.6)
+                        break
+                except Exception:
+                    continue
+
+            await self.page.keyboard.press("Escape")
+            await asyncio.sleep(0.3)
+            await self.dismiss_overlays()
+            await self.stats.increment('shares')
+            logger.success(f"[{email}] شير على @{target_username or 'الفيديو'}{' (نسخ)' if copied else ''}")
+            return True
+        except Exception as e:
+            logger.warning(f"[{email}] فشل الشير: {type(e).__name__}: {e}")
+            return False
+
+    async def open_comments(self, email: str) -> bool:
+        logger.info(f"[{email}] فتح قسم التعليقات...")
+        await self.dismiss_overlays()
+        input_sel = [
+            'div[data-e2e="comment-input"]',
+            '[data-e2e="comment-input"]',
+            'div.public-DraftEditor-content',
+            'div[contenteditable="true"]',
+        ]
+        if await self.find_first(input_sel, timeout_ms=2500):
+            return True
+
+        icon_sel = [
+            'span[data-e2e="comment-icon"]',
+            'div[data-e2e="comment-icon"]',
+            'button[data-e2e="comment-icon"]',
+            '[data-e2e="browse-comment-icon"]',
+            'strong[data-e2e="comment-count"]',
+            'strong[data-e2e="browse-comment-count"]',
+        ]
+        btn = await self.find_first(icon_sel, timeout_ms=5000)
+        if btn:
+            try:
+                await btn.click(timeout=4000)
+            except Exception:
+                await btn.click(force=True)
+            await asyncio.sleep(2)
+            return True
+        logger.warning(f"[{email}] لم يجد زر أو حقل التعليقات")
+        return False
 
     async def update_video_id(self):
         """Обновляет идентификатор текущего видео, используя URL или другие данные"""
@@ -212,33 +771,76 @@ class TikTokActions:
             logger.warning(f"Не удалось определить ID видео: {e}")
             self.current_video_id = f"unknown_{datetime.now().strftime('%H%M%S')}"
 
-    async def post_comment(self, email: str) -> bool:
+    async def post_comment(self, email: str, comment_text: str = None) -> bool:
         """Оставляет комментарий под текущим видео"""
         if not self.config.enable_commenting:
             return False
 
         try:
             await self.update_video_id()
+            if comment_text is None:
+                comment_text = self.get_comment_text(email)
+            if not comment_text:
+                logger.warning(f"[{email}] لا يوجد تعليق متاح — أضف تعليقات من اللوحة")
+                return False
 
-            # Используем ПЕРВОЕ поле ввода для основного комментария
-            comment_input = self.page.locator('div[data-e2e="comment-input"]').first
-            await comment_input.click()
+            await self.open_comments(email)
+            await asyncio.sleep(1)
+
+            # placeholder يعترض النقر — نضغطه مباشرة أو نستخدم force
+            focused = False
+            for sel in [
+                '.public-DraftEditorPlaceholder-inner',
+                'div.public-DraftEditor-content[contenteditable="true"]',
+                'div[data-e2e="comment-input"] div[contenteditable="true"]',
+                'div[data-e2e="comment-input"]',
+                '[data-e2e="comment-input"]',
+            ]:
+                loc = self.page.locator(sel).first
+                try:
+                    await loc.wait_for(state="attached", timeout=4000)
+                    try:
+                        await loc.click(timeout=2500)
+                    except Exception:
+                        await loc.click(force=True, timeout=2500)
+                    focused = True
+                    break
+                except Exception:
+                    continue
+
+            if not focused:
+                logger.error(f"[{email}] لم يجد حقل كتابة التعليق")
+                return False
+
+            await asyncio.sleep(0.4)
+            await self.page.keyboard.press("Control+A")
+            await self.page.keyboard.type(comment_text, delay=50)
             await asyncio.sleep(self.config.action_delay)
 
-            comment_text = self.get_comment_text()
-            await self.page.keyboard.type(comment_text)
-            await asyncio.sleep(self.config.action_delay)
-            await self.page.keyboard.press('Enter')
+            posted = False
+            for sel in [
+                'div[data-e2e="comment-post"]',
+                '[data-e2e="comment-post"]',
+                'button[data-e2e="comment-post"]',
+            ]:
+                btn = self.page.locator(sel).first
+                try:
+                    if await btn.count() > 0 and await btn.is_visible():
+                        await btn.click(force=True)
+                        posted = True
+                        break
+                except Exception:
+                    continue
+            if not posted:
+                await self.page.keyboard.press("Enter")
             await asyncio.sleep(self.config.comment_delay)
 
-            # Обновляем статистику
             await self.stats.increment('comments')
             self.stats.counters['comments_per_video'][self.current_video_id] = self.stats.counters[
                                                                                    'comments_per_video'].get(
                 self.current_video_id, 0) + 1
 
-            logger.success(
-                f"Успешно оставлен комментарий для {email} (Видео: {self.current_video_id}, #{self.stats.counters['comments_per_video'][self.current_video_id]})")
+            logger.success(f"[{email}] تم نشر التعليق: {comment_text}")
             return True
         except Exception as e:
             logger.error(f"Ошибка при оставлении комментария: {type(e).__name__}: {str(e)}")
@@ -260,7 +862,9 @@ class TikTokActions:
             await reply_input.click()
             await asyncio.sleep(self.config.action_delay)
 
-            comment_text = self.get_comment_text()
+            comment_text = self.get_comment_text(email)
+            if not comment_text:
+                return False
             await self.page.keyboard.type(comment_text)
             await asyncio.sleep(self.config.action_delay)
 
@@ -274,68 +878,338 @@ class TikTokActions:
             logger.warning(f"Не удалось ответить на комментарий: {type(e).__name__}: {str(e)}")
             return False
 
-    async def post_comment(self, email: str) -> bool:
-        """Оставляет комментарий под текущим видео"""
-        if not self.config.enable_commenting:
             return False
 
-        try:
-            await self.update_video_id()
-
-            # Используем ПЕРВОЕ поле ввода для основного комментария
-            comment_input = self.page.locator('div[data-e2e="comment-input"]').first
-            await comment_input.click()
-            await asyncio.sleep(self.config.action_delay)
-
-            comment_text = self.get_comment_text()
-            await self.page.keyboard.type(comment_text)
-            await asyncio.sleep(self.config.action_delay)
-            await self.page.keyboard.press('Enter')
-            await asyncio.sleep(self.config.comment_delay)
-
-            # Обновляем статистику
-            await self.stats.increment('comments')
-            self.stats.counters['comments_per_video'][self.current_video_id] = self.stats.counters[
-                                                                                   'comments_per_video'].get(
-                self.current_video_id, 0) + 1
-
-            logger.success(
-                f"Успешно оставлен комментарий для {email} (Видео: {self.current_video_id}, #{self.stats.counters['comments_per_video'][self.current_video_id]})")
-            return True
-        except Exception as e:
-            logger.error(f"Ошибка при оставлении комментария: {type(e).__name__}: {str(e)}")
+    async def wait_until_video_ends(self, email: str, max_wait: int = 180, video_url: str = None) -> bool:
+        """يشاهد الفيديو فعلياً حتى النهاية (مهم لعدّ المشاهدات)."""
+        logger.info(f"[{email}] مشاهدة الفيديو حتى النهاية...")
+        if not await self.ensure_video_plays(email, video_url=video_url):
+            logger.warning(f"[{email}] فشل تشغيل الفيديو بعد عدة محاولات")
             return False
+        started = time.time()
+        last_t = -1.0
+        stuck = 0
+        min_watch = 15  # أقل مدة مشاهدة قبل الانتقال
 
-    async def like_video(self, email: str) -> bool:
-        """Ставит лайк текущему видео"""
-        if not self.config.enable_liking:
-            return False
+        while time.time() - started < max_wait:
+            if await self.has_playback_error():
+                logger.warning(f"[{email}] ظهر خطأ تشغيل أثناء المشاهدة — refresh")
+                if not await self.ensure_video_plays(email, video_url=video_url):
+                    return False
 
-        try:
-            like_button_browse = self.page.locator('strong[data-e2e="browse-like-count"]').first
-            like_button_standard = self.page.locator('strong[data-e2e="like-count"]').first
+            await self.dismiss_overlays()
+            info = await self.page.evaluate(
+                """async () => {
+                    const v = document.querySelector('video');
+                    if (!v) return null;
+                    try {
+                        if (v.paused) { await v.play(); }
+                        try { v.muted = false; } catch(e) {}
+                    } catch(e) {}
+                    
+                    // Random small scroll
+                    if (Math.random() > 0.7) {
+                        window.scrollBy(0, Math.random() > 0.5 ? 20 : -20);
+                    }
+                    
+                    return {
+                        current: v.currentTime || 0,
+                        duration: v.duration || 0,
+                        ended: !!v.ended,
+                        paused: !!v.paused
+                    };
+                }"""
+            )
+            if not info:
+                await self.ensure_video_plays(email, video_url=video_url)
+                await asyncio.sleep(1)
+                continue
 
-            if await like_button_browse.count() > 0:
-                logger.info("Найдена кнопка browse-like-count")
-                await like_button_browse.click()
-                await asyncio.sleep(self.config.action_delay)
-                logger.success(f"Успешно поставлен лайк (browse-like-count) для {email}")
-                await self.stats.increment('likes')
+            cur = float(info.get("current") or 0)
+            dur = float(info.get("duration") or 0)
+            watched = time.time() - started
+
+            if info.get("ended") and watched >= min_watch:
+                logger.success(f"[{email}] انتهى الفيديو بعد {watched:.0f}ث")
                 return True
-            elif await like_button_standard.count() > 0:
-                logger.info("Найдена кнопка like-count")
-                await like_button_standard.click()
-                await asyncio.sleep(self.config.action_delay)
-                logger.success(f"Успешно поставлен лайк (like-count) для {email}")
-                await self.stats.increment('likes')
+            if dur > 1 and cur >= max(dur - 0.8, dur * 0.95) and watched >= min_watch:
+                logger.success(f"[{email}] شوهد كاملاً ({cur:.1f}/{dur:.1f})")
                 return True
+
+            if abs(cur - last_t) < 0.08:
+                stuck += 1
+                if stuck % 5 == 0:
+                    await self.play_video(email)
             else:
-                logger.warning("Не найдена кнопка лайка")
-                return False
+                stuck = 0
+            last_t = cur
 
-        except Exception as e:
-            logger.error(f"Ошибка при постановке лайка: {type(e).__name__}: {str(e)}")
+            if stuck >= 25 and watched >= min_watch:
+                logger.warning(f"[{email}] الفيديو عالق بعد مشاهدة {watched:.0f}ث — التالي")
+                return True
+
+            await asyncio.sleep(1)
+
+        logger.warning(f"[{email}] تجاوز وقت مشاهدة الفيديو ({max_wait}ث)")
+        return True
+
+    async def scroll_to_next(self, email: str) -> bool:
+        """سكرول / انتقال للفيديو التالي."""
+        prev_url = self.page.url
+        prev_id = None
+        try:
+            prev_id = await self.page.evaluate(
+                """() => {
+                    const v = document.querySelector('video');
+                    return v ? (v.currentSrc || v.src || '') : '';
+                }"""
+            )
+        except Exception:
+            pass
+
+        # 1) زر السهم
+        for sel in [
+            'button[data-e2e="arrow-right"]',
+            'button[data-e2e="arrow-down"]',
+            '[data-e2e="arrow-right"]',
+            '.css-1s9jpf8-ButtonBasicButtonContainer-StyledVideoSwitch',
+        ]:
+            btn = self.page.locator(sel).first
+            try:
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(force=True)
+                    await asyncio.sleep(1.5)
+                    await self.stats.increment('next_videos')
+                    logger.success(f"[{email}] سكرول للفيديو التالي (زر)")
+                    return True
+            except Exception:
+                continue
+
+        # 2) سهم لوحة المفاتيح
+        try:
+            await self.page.keyboard.press("ArrowDown")
+            await asyncio.sleep(1.5)
+        except Exception:
+            pass
+
+        # 3) عجلة الماوس
+        try:
+            await self.page.mouse.wheel(0, 1200)
+            await asyncio.sleep(1.5)
+        except Exception:
+            pass
+
+        # تحقق إن تغير شيء
+        try:
+            new_id = await self.page.evaluate(
+                """() => {
+                    const v = document.querySelector('video');
+                    return v ? (v.currentSrc || v.src || '') : '';
+                }"""
+            )
+            if (self.page.url != prev_url) or (new_id and new_id != prev_id):
+                await self.stats.increment('next_videos')
+                logger.success(f"[{email}] سكرول للفيديو التالي")
+                return True
+        except Exception:
+            pass
+
+        logger.warning(f"[{email}] تعذر الانتقال للفيديو التالي")
+        return False
+
+    async def open_profile_first_video(self, email: str, profile_url: str) -> bool:
+        """يفتح بروفايل الشخص ويضغط أول فيديو."""
+        logger.info(f"[{email}] فتح بروفايل للمراقبة: {profile_url}")
+        await self.page.goto(profile_url, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(3)
+        await self.dismiss_overlays()
+
+        # إن كنا أصلاً على فيديو
+        if "/video/" in self.page.url:
+            return True
+
+        selectors = [
+            'div[data-e2e="user-post-item"] a',
+            'a[href*="/video/"]',
+            '[data-e2e="user-post-item"]',
+        ]
+        for sel in selectors:
+            item = self.page.locator(sel).first
+            try:
+                await item.wait_for(state="visible", timeout=8000)
+                href = await item.get_attribute("href")
+                if href and "/video/" in href:
+                    if not href.startswith("http"):
+                        href = "https://www.tiktok.com" + href
+                    await self.page.goto(href, wait_until="domcontentloaded", timeout=45000)
+                    await asyncio.sleep(3)
+                    return True
+                await item.click(force=True)
+                await asyncio.sleep(3)
+                if "/video/" in self.page.url or await self.page.locator("video").count() > 0:
+                    return True
+            except Exception:
+                continue
+
+        logger.error(f"[{email}] لم يجد فيديوهات على البروفايل")
+        return False
+
+    def extract_username(self, url: str) -> str:
+        """يستخرج @username من رابط بروفايل أو فيديو."""
+        if not url:
+            return ""
+        m = re.search(r"tiktok\.com/@([^/?]+)", url, re.IGNORECASE)
+        return (m.group(1) if m else "").lower().lstrip("@")
+
+    def normalize_profile_url(self, url: str) -> str:
+        """يحول أي رابط حساب/فيديو إلى بروفايل نظيف."""
+        username = self.extract_username(url)
+        if not username:
+            return (url or "").strip()
+        return f"https://www.tiktok.com/@{username}"
+
+    def is_target_creator_video(self, target_username: str) -> bool:
+        if not target_username:
             return False
+        url = (self.page.url or "").lower()
+        return f"/@{target_username.lower()}" in url and "/video/" in url
+
+    async def collect_profile_videos(self, email: str, profile_url: str, limit: int = 40) -> List[str]:
+        """يجمع روابط فيديوهات البروفايل فقط."""
+        profile_url = self.normalize_profile_url(profile_url)
+        await self.page.goto(profile_url, wait_until="domcontentloaded", timeout=45000)
+        await asyncio.sleep(3)
+        await self.dismiss_overlays()
+
+        username = self.extract_username(profile_url)
+        links = []
+        seen = set()
+
+        for _ in range(10):
+            hrefs = await self.page.eval_on_selector_all(
+                'a[href*="/video/"]',
+                "els => els.map(e => e.href || e.getAttribute('href') || '')",
+            )
+            for href in hrefs or []:
+                if not href:
+                    continue
+                if href.startswith("/"):
+                    href = "https://www.tiktok.com" + href
+                href = href.split("?")[0].rstrip("/")
+                # تجاهل روابط ناقصة مثل .../video/
+                if not re.search(r"/video/\d+", href):
+                    continue
+                if username and f"/@{username}/video/" not in href.lower():
+                    continue
+                if href not in seen:
+                    seen.add(href)
+                    links.append(href)
+            if limit and len(links) >= limit:
+                break
+            await self.page.mouse.wheel(0, 1800)
+            await asyncio.sleep(1.2)
+
+        logger.info(f"[{email}] تم جمع {len(links)} فيديو من @{username}")
+        return links[:limit] if limit else links
+
+    async def watch_profile_loop(self, email: str, captcha_solver=None) -> None:
+        """يشاهد فيديوهات حساب محدد فقط ويقلبها: مشاهدة → لايك → شير → التالي."""
+        raw = (self.config.profile_url or "").strip() or (self.config.target_video_url or "").strip()
+        if not raw:
+            logger.error(f"[{email}] لا يوجد رابط بروفايل/فيديو للمراقبة")
+            return
+
+        username = self.extract_username(raw)
+        if not username:
+            logger.error(f"[{email}] رابط غير صالح: {raw}")
+            return
+        profile_url = self.normalize_profile_url(raw)
+        logger.info(f"[{email}] قلب فيديوهات @{username} فقط من {profile_url}")
+
+        max_n = int(self.config.watch_count or 0)
+        n = 0
+        visited = set()
+        commented_once = False
+
+        while max_n <= 0 or n < max_n:
+            global STOP_BOT_FLAG
+            if STOP_BOT_FLAG:
+                logger.info(f"[{email}] توقف البوت بسبب أمر الإيقاف")
+                break
+            videos = await self.collect_profile_videos(
+                email,
+                profile_url,
+                limit=80 if max_n <= 0 else max(max_n + 5, 20),
+            )
+            if not videos:
+                logger.warning(f"[{email}] لا توجد فيديوهات على @{username}")
+                break
+
+            progressed = False
+            for video_url in videos:
+                if STOP_BOT_FLAG:
+                    break
+                if max_n > 0 and n >= max_n:
+                    break
+                vid_id = video_url.rstrip("/").split("/")[-1]
+                if not vid_id.isdigit() or vid_id in visited:
+                    continue
+                visited.add(vid_id)
+                n += 1
+                progressed = True
+
+                logger.info(f"[{email}] فيديو #{n} لـ @{username}: {video_url}")
+                
+                # استخدام API الـ History الخاص بالمتصفح بدل الانتقال المباشر إذا أمكن
+                await self.page.evaluate(f"window.history.pushState(null, '', '{video_url}');")
+                await self.page.goto(video_url, wait_until="domcontentloaded", timeout=45000, referer=profile_url)
+                await asyncio.sleep(4)
+                await self.dismiss_overlays()
+
+                # لازم نكون على فيديو الحساب المستهدف فقط (مو You may like)
+                if not self.is_target_creator_video(username):
+                    logger.warning(f"[{email}] تخطي — الرابط مو لـ @{username}: {self.page.url}")
+                    continue
+
+                try:
+                    if captcha_solver:
+                        await captcha_solver.solve_captcha_if_present()
+                except Exception:
+                    pass
+
+                played = await self.wait_until_video_ends(email, video_url=video_url)
+                if not played:
+                    logger.warning(f"[{email}] تخطي الفيديو بسبب فشل التشغيل")
+                    continue
+
+                # تأكيد مرة ثانية قبل أي تفاعل
+                if not self.is_target_creator_video(username):
+                    logger.warning(f"[{email}] خرجنا من حساب @{username} — بدون لايك/تعليق")
+                    continue
+
+                await self.stats.increment('watched')
+                await self.like_video(email, target_username=username)
+                await self.share_video(email, target_username=username)
+                # تعليق واحد فقط لكل حساب من المجمع (يُحذف بعد الاستخدام)
+                if self.config.enable_commenting and not commented_once:
+                    ok = await self.post_comment(email)
+                    if ok:
+                        commented_once = True
+
+                await asyncio.sleep(1.5)
+
+            if max_n > 0 and n >= max_n:
+                break
+            if not progressed:
+                logger.info(f"[{email}] خلصت فيديوهات @{username} المتاحة")
+                break
+            logger.info(f"[{email}] إعادة تحميل بروفايل @{username}...")
+            await asyncio.sleep(2)
+
+        logger.success(
+            f"[{email}] انتهت المراقبة على @{username} — مشاهدات {self.stats.counters.get('watched', 0)} | "
+            f"لايك {self.stats.counters.get('likes', 0)} | شير {self.stats.counters.get('shares', 0)}"
+        )
 
     async def next_video(self, email: str, captcha_solver) -> bool:
         """Переходит к следующему видео"""
@@ -461,10 +1335,279 @@ class TikTokChecker:
         self.file_handler = FileHandler(config)
         self.successful_logins = []  # Отслеживание успешных входов в браузер
 
+    async def safe_goto(self, page: Page, url: str, email: str) -> bool:
+        """يفتح الرابط بدون انتظار حدث load الكامل (TikTok غالباً ما يكمله)."""
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            await asyncio.sleep(3)
+            return True
+        except Exception as e:
+            logger.warning(f"[{email}] تنبيه أثناء فتح {url}: {type(e).__name__}: {e}")
+            # الصفحة غالباً تكون ظهرت أصلاً رغم الـ timeout
+            await asyncio.sleep(3)
+            return "tiktok.com" in (page.url or "")
+
+    async def is_logged_in(self, page: Page) -> bool:
+        """يتحقق إذا المستخدم مسجّل دخول فعلاً."""
+        url = page.url or ""
+        if "/login" in url:
+            return False
+        login_form = page.locator('input[type="password"]')
+        if await login_form.count() > 0 and await login_form.first.is_visible():
+            return False
+        logged_in_selectors = [
+            '[data-e2e="profile-icon"]',
+            '[data-e2e="nav-profile"]',
+            'a[href*="/@"]',
+            '[data-e2e="top-digg-icon"]',
+            '[data-e2e="like-icon"]',
+            '[data-e2e="comment-icon"]',
+        ]
+        for sel in logged_in_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    return True
+            except Exception:
+                continue
+        return "tiktok.com" in url and "/login" not in url and "verify" not in url
+
+    async def has_code_input(self, page: Page) -> bool:
+        selectors = [
+            'input[name="verifyCode"]',
+            '.verification-code-input',
+            'input[placeholder*="Digit code" i]',
+            'input[placeholder*="code" i]',
+            'input[placeholder*="Code"]',
+            'input[maxlength="6"]',
+            'input[autocomplete="one-time-code"]',
+        ]
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
+    async def needs_otp(self, page: Page) -> bool:
+        url = (page.url or "").lower()
+        if "verify" in url or "otp" in url:
+            return True
+        if await self.has_code_input(page):
+            return True
+        if await self.has_verify_method_picker(page):
+            return True
+        return False
+
+    async def has_verify_method_picker(self, page: Page) -> bool:
+        """شاشة Verify it's really you فقط (مو أي Email بالصفحة)."""
+        try:
+            title = page.locator("text=/Verify it.?s really you/i").first
+            if await title.count() > 0 and await title.is_visible():
+                return True
+        except Exception:
+            pass
+        try:
+            body = (await page.inner_text("body"))[:2000]
+            if "Verify it's really you" in body or "Verify it’s really you" in body:
+                if "Email" in body and ("***" in body or "@" in body):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def click_email_verification_method(self, page: Page, email: str) -> bool:
+        """يضغط خيار Email مرة واحدة لإرسال الرمز."""
+        if not await self.has_verify_method_picker(page):
+            return False
+
+        logger.info(f"[{email}] شاشة Verify — الضغط على Email لإرسال الكود...")
+        domain = (email or "").split("@")[-1] if "@" in (email or "") else ""
+
+        # اضغط صف Email الذي فيه الإيميل المخفي
+        clicked = await page.evaluate(
+            """(domain) => {
+                const nodes = Array.from(document.querySelectorAll('div,button,li,a,span'));
+                const hit = nodes.find(n => {
+                    const t = (n.innerText || '').replace(/\\s+/g,' ').trim();
+                    if (!t) return false;
+                    const lines = t.split('\\n').map(s => s.trim()).filter(Boolean);
+                    const hasEmailWord = lines.some(l => l === 'Email' || l.startsWith('Email'));
+                    const hasMasked = /@/.test(t) && (/\\*/.test(t) || (domain && t.toLowerCase().includes(domain.toLowerCase())));
+                    return hasEmailWord && hasMasked && t.length < 120;
+                });
+                if (!hit) {
+                    const fallback = nodes.find(n => {
+                        const t = (n.innerText || '').trim();
+                        return t === 'Email' || (t.startsWith('Email') && t.includes('@'));
+                    });
+                    if (!fallback) return false;
+                    (fallback.closest('button,div[role="button"],li,a,div') || fallback).click();
+                    return true;
+                }
+                (hit.closest('button,div[role="button"],li,a,div') || hit).click();
+                return true;
+            }""",
+            domain,
+        )
+        if clicked:
+            await asyncio.sleep(3)
+            logger.success(f"[{email}] تم اختيار Email — بانتظار وصول الكود")
+            return True
+
+        logger.warning(f"[{email}] لم يجد خيار Email للضغط")
+        return False
+
+    async def fill_otp(self, page: Page, code: str, email: str) -> bool:
+        selectors = [
+            'input[name="verifyCode"]',
+            '.verification-code-input',
+            'input[placeholder*="code" i]',
+            'input[placeholder*="Code"]',
+            'input[maxlength="6"]',
+            'input[maxlength="4"]',
+            'input[type="tel"]',
+            'input[type="text"]',
+        ]
+        for sel in selectors:
+            loc = page.locator(sel).first
+            try:
+                if await loc.count() == 0:
+                    continue
+                if not await loc.is_visible():
+                    continue
+                await loc.click(force=True)
+                await loc.fill("")
+                await loc.type(code, delay=80)
+                await asyncio.sleep(0.8)
+
+                clicked_next = False
+                for btn_sel in [
+                    'button:has-text("Next")',
+                    'button[data-e2e="email-verification-submit"]',
+                    'button[type="submit"]',
+                    'button:has-text("Verify")',
+                    'button:has-text("Continue")',
+                    'button:has-text("Submit")',
+                    'div[role="button"]:has-text("Next")',
+                ]:
+                    btn = page.locator(btn_sel).first
+                    try:
+                        if await btn.count() > 0 and await btn.is_visible():
+                            await btn.click(force=True)
+                            clicked_next = True
+                            logger.info(f"[{email}] تم الضغط على Next بعد OTP")
+                            break
+                    except Exception:
+                        continue
+                if not clicked_next:
+                    await page.keyboard.press("Enter")
+                    logger.info(f"[{email}] تم إرسال OTP بـ Enter")
+
+                logger.success(f"[{email}] تم إدخال OTP تلقائياً: {code}")
+                await asyncio.sleep(3)
+
+                # لو لسا ظاهر Next جرب مرة ثانية
+                try:
+                    nxt = page.locator('button:has-text("Next")').first
+                    if await nxt.count() > 0 and await nxt.is_visible():
+                        await nxt.click(force=True)
+                        await asyncio.sleep(2)
+                except Exception:
+                    pass
+                return True
+            except Exception:
+                continue
+        logger.warning(f"[{email}] وجد OTP لكن تعذر إدخاله في الصفحة")
+        return False
+
+    async def wait_for_login(self, page: Page, email: str, email_password: str = None, max_wait: int = 180, mailbox_login: str = None) -> bool:
+        """ينتظر اكتمال الدخول مع OTP من Hostinger."""
+        after_ts = time.time() - 5
+        waited = 0
+        otp_tried = False
+        email_clicked = False
+        mailbox_login = mailbox_login or email
+
+        logger.warning(
+            f"[{email}] انتظار الدخول (OTP من Hostinger: {mailbox_login}) — حتى {max_wait}ث..."
+        )
+
+        while waited < max_wait:
+            if await self.is_logged_in(page):
+                logger.success(f"[{email}] تم تسجيل الدخول بنجاح")
+                return True
+
+            # 1) شاشة اختيار الطريقة → اضغط Email مرة واحدة فقط
+            if not email_clicked and await self.has_verify_method_picker(page):
+                if await self.click_email_verification_method(page, email):
+                    email_clicked = True
+                    after_ts = time.time() - 2
+                    await asyncio.sleep(3)
+
+            # 2) بعد اختيار Email أو ظهور حقل الكود → جلب OTP من Hostinger
+            if (
+                self.config.auto_otp
+                and not otp_tried
+                and email_password
+                and (email_clicked or await self.has_code_input(page))
+            ):
+                # انتظر ظهور حقل الكود قليلاً
+                for _ in range(10):
+                    if await self.has_code_input(page) or await self.is_logged_in(page):
+                        break
+                    await asyncio.sleep(1)
+                    waited += 1
+
+                if await self.is_logged_in(page):
+                    return True
+
+                logger.info(f"[{email}] جلب OTP من Hostinger ({mailbox_login}) لحساب {email}...")
+                code = await asyncio.to_thread(
+                    wait_for_otp,
+                    mailbox_login,
+                    email_password,
+                    timeout=min(self.config.otp_timeout, max(30, max_wait - waited)),
+                    poll_interval=4,
+                    imap_host=self.config.imap_host,
+                    imap_port=self.config.imap_port,
+                    after_ts=after_ts,
+                    for_account=email,
+                )
+                otp_tried = True
+                if code:
+                    await self.fill_otp(page, code, email)
+                    await asyncio.sleep(3)
+                    if await self.is_logged_in(page):
+                        logger.success(f"[{email}] تم تسجيل الدخول بعد OTP")
+                        return True
+                else:
+                    logger.warning(f"[{email}] لم يُجلب OTP من Hostinger — أكمل يدوياً إن لزم")
+
+            await asyncio.sleep(3)
+            waited += 3
+            if waited % 15 == 0:
+                logger.info(f"[{email}] لا يزال ينتظر الدخول... ({waited}/{max_wait}ث) | URL: {page.url}")
+
+        logger.warning(f"[{email}] انتهى وقت انتظار الدخول ({max_wait}ث) | URL: {page.url}")
+        return False
+
+    async def save_session(self, context, email: str):
+        path = self.file_handler.session_path(email)
+        try:
+            await context.storage_state(path=path)
+            logger.info(f"[{email}] تم حفظ الجلسة في {path}")
+        except Exception as e:
+            logger.warning(f"[{email}] تعذر حفظ الجلسة: {e}")
+
     async def check_account(self, account: Dict) -> bool:
         """Проверяет один аккаунт TikTok"""
         email = account['email']
         password = account['password']
+        email_password = account.get('email_password') or password
+        mailbox_email = account.get('mailbox_email') or account.get('mailbox') or email
 
         for attempt in range(1, self.config.max_check_attempts + 1):
             if attempt > 1:
@@ -477,17 +1620,22 @@ class TikTokChecker:
                 async with async_playwright() as p:
                     browser = await p.chromium.launch(
                         headless=self.config.browser_headless,
-                        args=self.config.browser_args
+                        args=self.config.browser_args,
+                        executable_path=r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
                     )
 
-                    context = await browser.new_context(**self.config.browser_context_options)
+                    session_file = self.file_handler.session_path(email)
+                    context_kwargs = dict(self.config.browser_context_options)
+                    if os.path.exists(session_file):
+                        context_kwargs["storage_state"] = session_file
+                        logger.info(f"[{email}] تم تحميل جلسة محفوظة")
+                    context = await browser.new_context(**context_kwargs)
                     context.set_default_timeout(self.config.page_timeout * 1000)
 
                     page = await context.new_page()
 
-                    # Настройка stealth
-                    config = StealthConfig(**self.config.stealth_config)
-                    await stealth_async(page, config)
+                    stealth = Stealth()
+                    await stealth.apply_stealth_async(page)
 
                     # Инициализация решателя капчи
                     captcha_solver = AsyncPlaywrightSolver(
@@ -497,55 +1645,137 @@ class TikTokChecker:
                         mouse_step_delay_ms=5
                     )
 
-                    # Загрузка страницы логина
-                    await page.goto('https://www.tiktok.com/login/phone-or-email/email')
-                    await asyncio.sleep(self.config.action_delay)
+                    logged_in = False
+                    if os.path.exists(session_file):
+                        await self.safe_goto(page, 'https://www.tiktok.com', email)
+                        logged_in = await self.is_logged_in(page)
+                        if logged_in:
+                            logger.success(f"[{email}] الجلسة المحفوظة ما زالت صالحة")
 
-                    # Локаторы элементов формы
-                    email_input = page.locator('input[type="text"]')
-                    password_input = page.locator('input[type="password"]')
-                    login_button = page.locator('button[data-e2e="login-button"], button[type="submit"]')
+                    if not logged_in:
+                        # Загрузка страницы логина
+                        await self.safe_goto(page, 'https://www.tiktok.com/login/phone-or-email/email', email)
 
-                    # Проверка существования элементов формы
-                    if await email_input.count() == 0 or await password_input.count() == 0 or await login_button.count() == 0:
-                        logger.warning(f"Не удалось загрузить форму входа для {email}")
-                        continue
+                        # Локаторы элементов формы
+                        email_input = page.locator('input[type="text"]')
+                        password_input = page.locator('input[type="password"]')
+                        login_button = page.locator('button[data-e2e="login-button"], button[type="submit"]')
 
-                    # Заполнение формы входа
-                    await email_input.fill(email)
-                    await asyncio.sleep(self.config.action_delay)
-                    await password_input.fill(password)
-                    await asyncio.sleep(self.config.action_delay)
+                        # Проверка существования элементов формы
+                        if await email_input.count() == 0 or await password_input.count() == 0 or await login_button.count() == 0:
+                            logger.warning(f"Не удалось загрузить форму входа для {email} — انتظر الدخول اليدوي")
+                            logged_in = await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
+                        else:
+                            # Заполнение формы входа
+                            await email_input.fill(email)
+                            await asyncio.sleep(self.config.action_delay)
+                            await password_input.fill(password)
+                            await asyncio.sleep(self.config.action_delay)
 
-                    # Нажатие кнопки входа
-                    await login_button.click()
-                    await asyncio.sleep(self.config.action_delay)
+                            # Нажатие кнопки входа
+                            await login_button.click()
+                            await asyncio.sleep(self.config.action_delay)
 
-                    # Попытка решить капчу
+                            # Попытка решить капчу
+                            try:
+                                await captcha_solver.solve_captcha_if_present()
+                            except Exception as e:
+                                logger.warning(f"Ошибка решения капчи: {type(e).__name__}: {str(e)}")
+
+                            await asyncio.sleep(5)
+                            # لو ظهرت شاشة اختيار طريقة التحقق — اضغط Email فوراً
+                            if await self.has_verify_method_picker(page):
+                                await self.click_email_verification_method(page, email)
+                            logged_in = await self.is_logged_in(page)
+                            if not logged_in:
+                                logged_in = await self.wait_for_login(page, email, email_password, mailbox_login=mailbox_email)
+
+                    if not logged_in:
+                        logger.warning(f"Аккаунт {email} - НЕВАЛИДНЫЙ ✗ | URL: {page.url}")
+                        await self.stats.increment('failed')
+                        return False
+
+                    await self.save_session(context, email)
+
+                    actions = TikTokActions(page, self.config, self.stats)
+                    mode = (self.config.bot_mode or "comment").strip().lower()
+
+                    if mode in ("watch", "watch_comment"):
+                        # ===== وضع مشاهدة مستمرة لحساب شخص =====
+                        success = self.file_handler.save_account(email, password, [])
+                        if success:
+                            await self.stats.increment('successful')
+                            logger.success(f"Успешный вход в аккаунт {email}")
+                        try:
+                            await actions.watch_profile_loop(email, captcha_solver)
+                        except Exception as e:
+                            logger.error(f"[{email}] خطأ في وضع المراقبة: {type(e).__name__}: {e}")
+
+                        try:
+                            report = await self.stats.get_report()
+                            logger.info(f"Текущая статистика действий:\n{report}")
+                        except Exception as e:
+                            logger.error(f"Ошибка при формировании отчета: {e}")
+
+                        if self.config.enable_hanging:
+                            self.successful_logins.append((browser, context))
+                            return True
+                        await context.close()
+                        await browser.close()
+                        return True
+
+                    # ===== وضع التعليق على فيديو محدد =====
+                    target = self.config.target_video_url.strip()
+                    is_short = any(x in target for x in ["vm.tiktok.com", "vt.tiktok.com", "/t/"])
+                    is_video = "/video/" in target or is_short
+                    is_profile = not is_video
+
+                    if is_profile:
+                        logger.info(f"[{email}] رابط بروفايل — فتح الصفحة للحصول على أول فيديو...")
+                        await self.safe_goto(page, target, email)
+                        try:
+                            await captcha_solver.solve_captcha_if_present()
+                        except Exception:
+                            pass
+                        await asyncio.sleep(2)
+                        first_video = page.locator('a[href*="/video/"]').first
+                        if await first_video.count() > 0:
+                            href = await first_video.get_attribute("href")
+                            if href and not href.startswith("http"):
+                                href = "https://www.tiktok.com" + href
+                            logger.info(f"[{email}] وجد أول فيديو: {href}")
+                            await self.safe_goto(page, href, email)
+                        else:
+                            logger.warning(f"[{email}] لم يجد فيديو على البروفايل، سيحاول النقر على أول مقطع...")
+                            video_thumb = page.locator('div[data-e2e="user-post-item"] a').first
+                            if await video_thumb.count() > 0:
+                                await video_thumb.click()
+                                await asyncio.sleep(4)
+                    else:
+                        logger.info(f"[{email}] الانتقال إلى الفيديو المستهدف: {target}")
+                        await self.safe_goto(page, target, email)
+                        for _ in range(20):
+                            if "/video/" in page.url:
+                                break
+                            await asyncio.sleep(0.5)
+                        logger.info(f"[{email}] بعد التحويل: {page.url}")
+
+                    # حل الكابتشا لو ظهرت بعد التنقل
                     try:
                         await captcha_solver.solve_captcha_if_present()
-                    except Exception as e:
-                        logger.warning(f"Ошибка решения капчи: {type(e).__name__}: {str(e)}")
-                        pass
-
-                    # Ожидание завершения входа
-                    await asyncio.sleep(8)
-
-                    # Проверка на код верификации
-                    try:
-                        verification_code = page.locator('.verification-code-input, input[name="verifyCode"]')
-                        if await verification_code.count() > 0:
-                            logger.warning(f"Аккаунт {email} требует код верификации")
-                            await self.stats.increment('failed')
-                            return False
                     except Exception:
                         pass
 
-                    current_url = page.url
-                    if "login" in current_url:
-                        logger.warning(f"Аккаунт {email} - НЕВАЛИДНЫЙ ✗")
+                    # التحقق من أن الصفحة حُمّلت بشكل صحيح
+                    if "login" in page.url:
+                        logger.warning(f"[{email}] تم تحويله لصفحة الدخول بعد فتح الفيديو")
                         await self.stats.increment('failed')
                         return False
+
+                    logger.info(f"[{email}] الصفحة الحالية: {page.url}")
+
+                    if "/video/" not in page.url:
+                        logger.warning(f"[{email}] لم يصل لصفحة فيديو بعد — سيحاول المتابعة على أي حال")
 
                     # Сохранение информации об аккаунте
                     success = self.file_handler.save_account(email, password, [])
@@ -554,33 +1784,17 @@ class TikTokChecker:
                         logger.success(f"Успешный вход в аккаунт {email}")
                         await self.stats.increment('successful')
 
-                        # Выполнение действий в TikTok
-                        actions = TikTokActions(page, self.config, self.stats)
-
                         try:
-                            # Для начала можем поставить лайк
+                            await captcha_solver.solve_captcha_if_present()
+                            await asyncio.sleep(self.config.comment_delay)
+                            await actions.play_video(email)
+
                             if self.config.enable_liking:
                                 await actions.like_video(email)
 
-                            # Запускаем основной цикл комментирования, если он включен
-                            if self.config.enable_comment_loop:
-                                logger.info(f"Запуск цикла комментирования для {email}")
-                                await actions.run_comment_loop(email, captcha_solver)
-                            else:
-                                # Традиционный подход без циклов
-                                comments_button = page.locator('span[data-e2e="comment-icon"]').first
-                                await comments_button.click()
-                                await captcha_solver.solve_captcha_if_present()
-                                await asyncio.sleep(self.config.comment_delay)
-
-                                # Попытка ответить на существующий комментарий
-                                await actions.reply_to_comment(email)
-
-                                # Оставить новый комментарий
+                            if self.config.enable_commenting:
+                                # تعليق واحد مستهلك من المجمع لكل حساب
                                 await actions.post_comment(email)
-
-                                # Перейти к следующему видео
-                                await actions.next_video(email, captcha_solver)
 
                         except Exception as e:
                             logger.error(f"Ошибка при выполнении действий для {email}: {type(e).__name__}: {str(e)}")
@@ -600,6 +1814,10 @@ class TikTokChecker:
                             await context.close()
                             await browser.close()
                             return True
+
+                    await context.close()
+                    await browser.close()
+                    return False
 
             except Exception as e:
                 logger.error(f"Ошибка проверки {email}: {type(e).__name__}: {str(e)}")
@@ -633,7 +1851,11 @@ class AccountProcessor:
 
     async def worker(self, worker_id: int, semaphore: asyncio.Semaphore):
         """Обработчик для одного параллельного потока проверки"""
+        global STOP_BOT_FLAG
         while True:
+            if STOP_BOT_FLAG:
+                logger.info(f"Worker {worker_id} stopping due to STOP_BOT_FLAG")
+                break
             async with self.lock:
                 if self.next_index >= len(self.accounts):
                     break
@@ -709,6 +1931,45 @@ class AccountProcessor:
                         pass
 
 
+async def run_bot(config: Config = None) -> dict:
+    """تشغيل البوت من الواجهة أو من سطر الأوامر."""
+    global STOP_BOT_FLAG
+    STOP_BOT_FLAG = False
+
+    if config is None:
+        config = Config.from_settings()
+
+    logger.info("=" * 60)
+    logger.info("TikTok Comment Bot - التعليق التلقائي على الفيديوهات")
+    logger.info("=" * 60)
+    logger.info(f"🎯 الفيديو المستهدف: {config.target_video_url}")
+    logger.info(f"👤 بروفايل المراقبة: {config.profile_url}")
+    logger.info(f"🎮 الوضع: {config.bot_mode}")
+    logger.info(f"💬 تعليقات متبقية في المجمع: {remaining_count()}")
+    logger.info(f"👥 أقصى عدد متصفحات متوازية: {config.max_browsers}")
+    logger.info(f"📧 OTP تلقائي من Hostinger: {'نعم' if config.auto_otp else 'لا'}")
+    logger.info("=" * 60)
+
+    if config.bot_mode in ("watch", "watch_comment"):
+        if not (config.profile_url or config.target_video_url):
+            logger.error("لم يتم تحديد رابط بروفايل للمراقبة")
+            return {"ok": False, "error": "no_profile_url"}
+    elif not config.target_video_url:
+        logger.error("لم يتم تحديد رابط فيديو")
+        return {"ok": False, "error": "no_video_url"}
+
+    file_handler = FileHandler(config)
+    accounts = file_handler.read_accounts()
+    if not accounts:
+        logger.error("لا توجد حسابات في acc.txt")
+        return {"ok": False, "error": "no_accounts"}
+
+    processor = AccountProcessor(accounts, config)
+    await processor.process_all()
+    report = await processor.stats.get_report()
+    return {"ok": True, "report": report, "stats": processor.stats.counters}
+
+
 async def main():
     """Основная функция скрипта"""
     logger.remove()
@@ -719,21 +1980,7 @@ async def main():
         level="INFO",
         format="{time:HH:mm:ss} | <level>{message}</level>"
     )
-
-    logger.info("=" * 60)
-    logger.info("Th - проверка аккаунтов")
-    logger.info("=" * 60)
-
-    # Инициализация конфигурации
-    config = Config()
-
-    # Загрузка аккаунтов
-    file_handler = FileHandler(config)
-    accounts = file_handler.read_accounts()
-
-    # Обработка аккаунтов
-    processor = AccountProcessor(accounts, config)
-    await processor.process_all()
+    await run_bot()
 
 
 if __name__ == "__main__":

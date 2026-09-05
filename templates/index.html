@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TikTok Bot — لوحة التحكم</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <div class="page">
+    <header class="hero">
+      <div>
+        <p class="brand">TikTok Comment Bot</p>
+        <h1>لوحة التحكم</h1>
+        <p class="sub">إدارة الحسابات، رابط الفيديو، OTP من Hostinger، وتشغيل البوت</p>
+      </div>
+      <div class="status-box" id="statusBox">
+        <span class="dot" id="statusDot"></span>
+        <span id="statusText">جاهز</span>
+      </div>
+    </header>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>الفيديو والمشاهدة</h2>
+
+        <label>وضع التشغيل</label>
+        <select id="botMode">
+          <option value="watch">مشاهدة مستمرة + شير</option>
+          <option value="comment">تعليق على فيديو محدد</option>
+        </select>
+
+        <label>رابط بروفايل الشخص (للمشاهدة)</label>
+        <input id="profileUrl" type="url" placeholder="https://www.tiktok.com/@username" />
+
+        <label>رابط فيديو محدد (لوضع التعليق)</label>
+        <input id="videoUrl" type="url" placeholder="https://www.tiktok.com/@user/video/..." />
+
+        <label>عدد الفيديوهات للمشاهدة (0 = لا نهائي)</label>
+        <input id="watchCount" type="number" min="0" max="9999" value="0" />
+
+        <label>مجمع التعليقات (كل سطر تعليق — يُحذف بعد الاستخدام)</label>
+        <p class="hint" id="commentsHint">متبقي: 0 | مستخدم: 0 — كل حساب يأخذ تعليقاً واحداً ويُزال من القائمة</p>
+        <textarea id="comments" rows="6" placeholder="بطل&#10;وحش&#10;نار&#10;..."></textarea>
+        <div class="row gap">
+          <button class="btn secondary" id="appendComments" type="button">إضافة للباقي</button>
+          <button class="btn ghost" id="replaceComments" type="button">استبدال الكل</button>
+        </div>
+
+        <div class="row checks">
+          <label class="check"><input type="checkbox" id="likeEnabled" checked /> لايك</label>
+          <label class="check"><input type="checkbox" id="shareEnabled" checked /> شير</label>
+          <label class="check"><input type="checkbox" id="commentEnabled" checked /> تعليق (من المجمع)</label>
+          <label class="check"><input type="checkbox" id="autoOtp" checked /> OTP تلقائي</label>
+        </div>
+
+        <div class="row two">
+          <div>
+            <label>عدد المتصفحات</label>
+            <input id="maxBrowsers" type="number" min="1" max="10" value="1" />
+          </div>
+          <div>
+            <label>مهلة OTP (ثانية)</label>
+            <input id="otpTimeout" type="number" min="30" max="300" value="90" />
+          </div>
+        </div>
+
+        <button class="btn primary" id="saveSettings">حفظ الإعدادات</button>
+      </article>
+
+      <article class="panel">
+        <h2>حسابات Hostinger (للـ OTP)</h2>
+        <p class="hint">كل حسابات الدومين بتجي على صندوق ميل واحد — ضيفه هنا واربط الحسابات فيه</p>
+
+        <div class="row two">
+          <div>
+            <label>إيميل Hostinger</label>
+            <input id="mbEmail" type="email" placeholder="ahmad@scaralphaai.com" />
+          </div>
+          <div>
+            <label>باسورد الميل</label>
+            <input id="mbPass" type="password" placeholder="••••••••" />
+          </div>
+        </div>
+        <label>اسم اختياري</label>
+        <input id="mbLabel" type="text" placeholder="Hostinger الرئيسي" />
+        <div class="row gap">
+          <button class="btn primary" id="addMailbox">حفظ صندوق Hostinger</button>
+        </div>
+        <ul class="account-list" id="mailboxList"></ul>
+      </article>
+
+      <article class="panel">
+        <h2>حسابات TikTok</h2>
+        <p class="hint">عند الإضافة اختر صندوق Hostinger اللي بتجيه رسائل OTP للمجموعة</p>
+
+        <label>صندوق Hostinger لهذه المجموعة</label>
+        <select id="accMailbox"></select>
+
+        <div class="row two">
+          <div>
+            <label>إيميل TikTok</label>
+            <input id="accEmail" type="email" placeholder="user@domain.com" />
+          </div>
+          <div>
+            <label>باسورد TikTok</label>
+            <input id="accPass" type="password" placeholder="••••••••" />
+          </div>
+        </div>
+
+        <div class="row gap">
+          <button class="btn primary" id="addAccount">إضافة حساب</button>
+          <button class="btn ghost" id="refreshAccounts">تحديث</button>
+        </div>
+
+        <ul class="account-list" id="accountList"></ul>
+
+        <label>استيراد مجموعة (كل سطر: إيميل:باسورد)</label>
+        <textarea id="bulkAccounts" rows="4" placeholder="ahmad1@scaralphaai.com:pass&#10;ahmad2@scaralphaai.com:pass"></textarea>
+        <div class="row gap">
+          <button class="btn secondary" id="importBulk">إضافة المجموعة لصندوق Hostinger المحدد</button>
+          <button class="btn ghost" id="replaceBulk">استبدال كل الحسابات</button>
+        </div>
+      </article>
+    </section>
+
+    <section class="panel run-panel">
+      <div class="row between">
+        <div>
+          <h2>تشغيل</h2>
+          <p class="hint" id="runHint">احفظ الإعدادات ثم شغّل البوت</p>
+        </div>
+        <button class="btn go" id="startBot">تشغيل البوت</button>
+        <button class="btn" id="stopBot" style="background: #e74c3c; color: white; display: none;">إيقاف البوت</button>
+      </div>
+      <pre class="logs" id="logs">اللوقز ستظهر هنا...</pre>
+    </section>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
