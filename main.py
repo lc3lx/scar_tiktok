@@ -16,7 +16,10 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v9"
+BOT_VERSION = "2026-09-09-instagram-v10"
+
+# بروكسي افتراضي — مفعّل دائماً إلا إذا غيّرته من اللوحة
+DEFAULT_PROXY = "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -232,8 +235,8 @@ def load_settings() -> dict:
         "auto_otp": True,
         "dashboard_host": "0.0.0.0",
         "dashboard_port": 5050,
-        "proxy_enabled": False,
-        "proxy": "",
+        "proxy_enabled": True,
+        "proxy": DEFAULT_PROXY,
         "force_relogin": False,
     }
     if os.path.exists(SETTINGS_FILE):
@@ -264,8 +267,8 @@ class Config:
     max_browsers: int = 1
     browser_headless: bool = True
     max_check_attempts: int = 1
-    proxy_enabled: bool = False
-    proxy: str = ""
+    proxy_enabled: bool = True
+    proxy: str = DEFAULT_PROXY
     force_relogin: bool = False
     page_timeout: int = 45
     action_delay: float = 1.0
@@ -330,8 +333,14 @@ class Config:
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
         cfg.browser_headless = bool(s.get("browser_headless", True))
-        cfg.proxy_enabled = bool(s.get("proxy_enabled", False))
-        cfg.proxy = (s.get("proxy") or "").strip()
+        cfg.proxy = (s.get("proxy") or "").strip() or DEFAULT_PROXY
+        # إذا في بروكسي → شغّالو (إلا إذا صراحة proxy_enabled=false وبلا قيمة)
+        if "proxy_enabled" in s:
+            cfg.proxy_enabled = bool(s.get("proxy_enabled"))
+        else:
+            cfg.proxy_enabled = True
+        if cfg.proxy and s.get("proxy_enabled") is not False:
+            cfg.proxy_enabled = True
         cfg.force_relogin = bool(s.get("force_relogin", False))
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = (s.get("imap_host") or "imap.hostinger.com").strip()
@@ -1759,6 +1768,18 @@ async def run_bot(config: Config = None) -> dict:
     if env_proxy:
         config.proxy = env_proxy
         config.proxy_enabled = True
+
+    # إجبار تشغيل البروكسي — ما عاد يتعطل بالغلط
+    if not (config.proxy or "").strip():
+        config.proxy = DEFAULT_PROXY
+    config.proxy_enabled = True
+    try:
+        s = load_settings()
+        s["proxy_enabled"] = True
+        s["proxy"] = config.proxy
+        save_settings(s)
+    except Exception:
+        pass
 
     migrate_from_settings(config.comment_texts)
 

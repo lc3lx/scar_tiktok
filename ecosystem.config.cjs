@@ -13,6 +13,7 @@ module.exports = {
         HOST: "0.0.0.0",
         PORT: "5050",
         PYTHONUNBUFFERED: "1",
+        IG_PROXY: "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK",
       },
     },
   ],
