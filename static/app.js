@@ -26,6 +26,7 @@ function settingsPayload() {
     profile_url: document.getElementById("profileUrl").value,
     bot_mode: document.getElementById("botMode").value,
     enable_liking: document.getElementById("likeEnabled").checked,
+    enable_repost: document.getElementById("repostEnabled").checked,
     enable_sharing: document.getElementById("shareEnabled").checked,
     enable_commenting: document.getElementById("commentEnabled").checked,
     auto_otp: document.getElementById("autoOtp").checked,
@@ -56,6 +57,7 @@ function fillSettings(s, comments) {
   if (mode === "comment") mode = "video";
   document.getElementById("botMode").value = mode;
   document.getElementById("likeEnabled").checked = !!s.enable_liking;
+  document.getElementById("repostEnabled").checked = s.enable_repost !== false;
   document.getElementById("shareEnabled").checked = s.enable_sharing !== false;
   document.getElementById("commentEnabled").checked = !!s.enable_commenting;
   document.getElementById("autoOtp").checked = s.auto_otp !== false;

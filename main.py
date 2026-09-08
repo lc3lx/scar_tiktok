@@ -15,7 +15,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v4"
+BOT_VERSION = "2026-09-09-instagram-v5"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -199,7 +199,8 @@ def load_settings() -> dict:
         "comment_all_in_order": True,
         "enable_liking": True,
         "enable_commenting": True,
-        "enable_sharing": True,  # story / share
+        "enable_sharing": True,  # story
+        "enable_repost": True,
         "watch_count": 3,
         "max_browsers": 1,
         "browser_headless": True,
@@ -249,6 +250,7 @@ class Config:
     enable_commenting: bool = True
     enable_liking: bool = True
     enable_sharing: bool = True
+    enable_repost: bool = True
     watch_count: int = 3
     auto_otp: bool = True
     imap_host: str = "imap.hostinger.com"
@@ -295,6 +297,7 @@ class Config:
         cfg.enable_liking = bool(s.get("enable_liking", True))
         cfg.enable_commenting = bool(s.get("enable_commenting", True))
         cfg.enable_sharing = bool(s.get("enable_sharing", True))
+        cfg.enable_repost = bool(s.get("enable_repost", True))
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
         cfg.browser_headless = bool(s.get("browser_headless", True))
@@ -321,6 +324,7 @@ class Stats:
         "likes": 0,
         "comments": 0,
         "stories": 0,
+        "reposts": 0,
         "shares": 0,
     })
 
@@ -336,7 +340,7 @@ class Stats:
             f"معالج: {c.get('processed', 0)}/{c.get('total_accounts', 0)} | "
             f"نجاح: {c.get('successful', 0)} | فشل: {c.get('failed', 0)} | أخطاء: {c.get('errors', 0)}\n"
             f"إجراءات: تعليقات={c.get('comments', 0)} | لايك={c.get('likes', 0)} | "
-            f"ستوري={c.get('stories', 0)} | شير={c.get('shares', 0)}"
+            f"ريبوست={c.get('reposts', 0)} | ستوري={c.get('stories', 0)} | شير={c.get('shares', 0)}"
         )
 
 
@@ -739,65 +743,156 @@ class InstagramBot:
             await self.dump_action_dom(account, "comment-exception")
             return False
 
-    async def share_to_story(self, account: str) -> bool:
-        """يحاول إضافة المنشور للستوري عبر قائمة Share."""
-        if not self.config.enable_sharing:
-            return False
+    async def _open_share_sheet(self, account: str) -> bool:
         await self.dismiss_overlays()
+        share_btn = self.page.locator(
+            'button:has(svg[aria-label="Share Post"]), button:has(svg[aria-label="Share"]), '
+            'svg[aria-label="Share Post"], svg[aria-label="Share"]'
+        ).first
         try:
-            share_btn = self.page.locator(
-                'button:has(svg[aria-label="Share Post"]), button:has(svg[aria-label="Share"]), '
-                'svg[aria-label="Share Post"], svg[aria-label="Share"]'
-            ).first
             if await share_btn.count() == 0 or not await share_btn.is_visible():
-                logger.warning(f"[{account}] زر الشير غير ظاهر")
-                return False
-            await share_btn.click(force=True)
-            await asyncio.sleep(1.5)
+                opened = await self.page.evaluate(
+                    """() => {
+                        const el = document.querySelector(
+                          'svg[aria-label="Share Post"], svg[aria-label="Share"], [aria-label="Share Post"], [aria-label="Share"]'
+                        );
+                        if (!el) return false;
+                        (el.closest('button,div[role="button"]') || el).click();
+                        return true;
+                    }"""
+                )
+                if not opened:
+                    logger.warning(f"[{account}] زر الشير غير ظاهر")
+                    return False
+            else:
+                await share_btn.click(force=True)
+            await asyncio.sleep(1.8)
+            return True
+        except Exception as e:
+            logger.warning(f"[{account}] فشل فتح قائمة الشير: {e}")
+            return False
 
+    async def _click_share_option(self, labels: list) -> bool:
+        for label in labels:
             for sel in [
-                'button:has-text("Add to story")',
-                'span:has-text("Add to story")',
-                'div[role="button"]:has-text("Add to story")',
-                'button:has-text("Add to your story")',
-                'span:has-text("Add to your story")',
+                f'button:has-text("{label}")',
+                f'span:has-text("{label}")',
+                f'div[role="button"]:has-text("{label}")',
+                f'[role="menuitem"]:has-text("{label}")',
             ]:
-                opt = self.page.locator(sel).first
-                if await opt.count() > 0 and await opt.is_visible():
-                    await opt.click(force=True)
-                    await asyncio.sleep(2)
-                    for conf in [
-                        'button:has-text("Share")',
-                        'div[role="button"]:has-text("Share")',
-                        'button:has-text("Done")',
-                    ]:
-                        c = self.page.locator(conf).first
-                        try:
-                            if await c.count() > 0 and await c.is_visible():
-                                await c.click(force=True)
-                                break
-                        except Exception:
-                            pass
-                    await self.stats.increment("stories")
-                    logger.success(f"[{account}] تمت إضافة المنشور إلى الستوري")
-                    await self.dismiss_overlays()
-                    return True
+                try:
+                    opt = self.page.locator(sel).first
+                    if await opt.count() > 0 and await opt.is_visible():
+                        await opt.click(force=True)
+                        await asyncio.sleep(1.5)
+                        return True
+                except Exception:
+                    continue
+        try:
+            clicked = await self.page.evaluate(
+                """(labels) => {
+                    const nodes = Array.from(document.querySelectorAll('button,div[role="button"],span,div'));
+                    for (const label of labels) {
+                      const hit = nodes.find(n => {
+                        const t = (n.innerText || '').replace(/\\s+/g,' ').trim();
+                        return t === label || t.startsWith(label);
+                      });
+                      if (hit) {
+                        const t = hit.closest('button,div[role="button"],div') || hit;
+                        const r = t.getBoundingClientRect();
+                        if (r.height > 0 && r.height < 120) { t.click(); return label; }
+                        hit.click();
+                        return label;
+                      }
+                    }
+                    return null;
+                }""",
+                labels,
+            )
+            if clicked:
+                await asyncio.sleep(1.5)
+                return True
+        except Exception:
+            pass
+        return False
 
-            # Copy link ليس نجاح ستوري — أغلق القائمة فقط
+    async def _confirm_share_dialog(self) -> None:
+        for conf in [
+            'button:has-text("Repost")',
+            'div[role="button"]:has-text("Repost")',
+            'button:has-text("Share")',
+            'div[role="button"]:has-text("Share")',
+            'button:has-text("Done")',
+            'button:has-text("OK")',
+        ]:
+            c = self.page.locator(conf).first
+            try:
+                if await c.count() > 0 and await c.is_visible():
+                    await c.click(force=True)
+                    await asyncio.sleep(1.2)
+                    break
+            except Exception:
+                continue
+
+    async def repost_current(self, account: str) -> bool:
+        """ريبوست المنشور إلى الحساب."""
+        if not getattr(self.config, "enable_repost", True):
+            return False
+        if not await self._open_share_sheet(account):
+            return False
+
+        ok = await self._click_share_option(["Repost", "Repost to", "Repost this"])
+        if ok:
+            await self._confirm_share_dialog()
+            await self._click_share_option(["Repost"])
+            await self._confirm_share_dialog()
+            await self.stats.increment("reposts")
+            logger.success(f"[{account}] تم عمل Repost للمنشور")
             try:
                 await self.page.keyboard.press("Escape")
             except Exception:
                 pass
             await self.dismiss_overlays()
-            logger.warning(f"[{account}] Add to story غير متاح على الويب")
+            return True
+
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self.dismiss_overlays()
+        logger.warning(f"[{account}] خيار Repost غير ظاهر على الويب لهذا المنشور")
+        return False
+
+    async def share_to_story(self, account: str) -> bool:
+        """إضافة المنشور للستوري عبر قائمة Share."""
+        if not self.config.enable_sharing:
             return False
-        except Exception as e:
-            logger.warning(f"[{account}] فشل الشير/ستوري: {type(e).__name__}: {e}")
+        if not await self._open_share_sheet(account):
+            return False
+
+        ok = await self._click_share_option([
+            "Add to story",
+            "Add to your story",
+            "Add post to your story",
+        ])
+        if ok:
+            await self._confirm_share_dialog()
+            await self.stats.increment("stories")
+            logger.success(f"[{account}] تمت إضافة المنشور إلى الستوري")
             try:
                 await self.page.keyboard.press("Escape")
             except Exception:
                 pass
-            return False
+            await self.dismiss_overlays()
+            return True
+
+        try:
+            await self.page.keyboard.press("Escape")
+        except Exception:
+            pass
+        await self.dismiss_overlays()
+        logger.warning(f"[{account}] Add to story غير متاح على الويب")
+        return False
 
     async def engage_profile(self, account: str) -> bool:
         profile = normalize_ig_url(self.config.profile_url)
@@ -851,6 +946,9 @@ class InstagramBot:
                 await asyncio.sleep(1)
                 if self.config.enable_commenting:
                     await self.comment_current(account)
+                    await asyncio.sleep(1)
+                if getattr(self.config, "enable_repost", True):
+                    await self.repost_current(account)
                     await asyncio.sleep(1)
                 await self.share_to_story(account)
                 opened += 1
@@ -907,17 +1005,21 @@ class InstagramBot:
 
         liked = False
         commented = False
+        reposted = False
         story = False
         if self.config.enable_liking:
             liked = await self.like_current(account)
         if self.config.enable_commenting:
             commented = await self.comment_current(account)
+        if getattr(self.config, "enable_repost", True):
+            reposted = await self.repost_current(account)
         if self.config.enable_sharing:
             story = await self.share_to_story(account)
 
-        ok = liked or commented or story
+        ok = liked or commented or reposted or story
         logger.info(
-            f"[{account}] نتيجة المنشور: like={liked} comment={commented} story={story}"
+            f"[{account}] نتيجة المنشور: like={liked} comment={commented} "
+            f"repost={reposted} story={story}"
         )
         return ok
 

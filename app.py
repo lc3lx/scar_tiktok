@@ -149,6 +149,7 @@ def api_settings():
         "enable_liking": bool(data.get("enable_liking", True)),
         "enable_commenting": bool(data.get("enable_commenting", True)),
         "enable_sharing": bool(data.get("enable_sharing", True)),
+        "enable_repost": bool(data.get("enable_repost", True)),
         "watch_count": int(data.get("watch_count", 3) or 3),
         "max_browsers": max(1, int(data.get("max_browsers", 1) or 1)),
         "browser_headless": bool(data.get("browser_headless", True)),
