@@ -938,15 +938,40 @@ class InstagramChecker:
             return "instagram.com" in (page.url or "")
 
     async def is_logged_in(self, page: Page) -> bool:
+        """تحقق صارم — لا نعتبر أي صفحة إنستغرام دخولاً ناجحاً."""
         url = (page.url or "").lower()
-        if "/accounts/login" in url or "/challenge" in url:
+        if "/accounts/login" in url or "/accounts/emailsignup" in url or "/challenge" in url:
             return False
+
+        # مؤشرات عدم الدخول
+        for sel in [
+            'input[name="username"]',
+            'input[name="password"]',
+            'a[href="/accounts/login/"]',
+            'a[href*="/accounts/login"]',
+        ]:
+            try:
+                loc = page.locator(sel).first
+                if await loc.count() > 0 and await loc.is_visible():
+                    return False
+            except Exception:
+                continue
+
+        try:
+            login_cta = page.locator('a:has-text("Log in"), button:has-text("Log in")').first
+            if await login_cta.count() > 0 and await login_cta.is_visible():
+                return False
+        except Exception:
+            pass
+
+        # مؤشرات دخول حقيقية فقط
         for sel in [
             'svg[aria-label="Home"]',
-            'a[href="/"] svg[aria-label="Home"]',
             'svg[aria-label="New post"]',
-            'svg[aria-label="Search"]',
-            'img[alt*="profile picture" i]',
+            'svg[aria-label="Reels"]',
+            'svg[aria-label="Direct"]',
+            'svg[aria-label="Messenger"]',
+            'a[href*="/direct/inbox"]',
         ]:
             try:
                 loc = page.locator(sel).first
@@ -954,14 +979,7 @@ class InstagramChecker:
                     return True
             except Exception:
                 continue
-        # login form present?
-        try:
-            pw = page.locator('input[name="password"]').first
-            if await pw.count() > 0 and await pw.is_visible():
-                return False
-        except Exception:
-            pass
-        return "instagram.com" in url and "/accounts/login" not in url
+        return False
 
     async def fill_otp_if_needed(
         self, page: Page, account: str, mailbox: str, mailbox_pass: str, after_ts: float
