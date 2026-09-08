@@ -16,13 +16,11 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v10"
+BOT_VERSION = "2026-09-09-instagram-v11"
 
 # بروكسي افتراضي — مفعّل دائماً إلا إذا غيّرته من اللوحة
 DEFAULT_PROXY = "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK"
-
-# #region agent log
-_DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
+_XVFB_PROC = None
 
 STOP_BOT_FLAG = False
 ACTIVE_BROWSERS: List[Any] = []
@@ -30,22 +28,55 @@ _BOT_LOOP = None
 LOGIN_OTP_LOCK: Optional[asyncio.Lock] = None
 
 
-def _dbg(hypothesis_id: str, location: str, message: str, data: dict = None, run_id: str = "run"):
+def ensure_virtual_display() -> None:
+    """على Linux بدون شاشة: شغّل Xvfb لفتح كروم نظامي (headed)."""
+    global _XVFB_PROC
+    if os.name == "nt":
+        return
+    if os.environ.get("DISPLAY"):
+        logger.info(f"DISPLAY موجود: {os.environ['DISPLAY']}")
+        return
+    display = os.environ.get("IG_DISPLAY", ":99")
+    import shutil
+    import subprocess
+
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        logger.error(
+            "Xvfb غير مثبّت — نفّذ: sudo apt-get install -y xvfb "
+            "ثم أعد تشغيل البوت (مطلوب لفتح متصفح نظامي على السيرفر)"
+        )
+        os.environ["DISPLAY"] = display
+        return
     try:
-        payload = {
-            "sessionId": "8e9bfe",
-            "runId": run_id,
-            "hypothesisId": hypothesis_id,
-            "location": location,
-            "message": message,
-            "data": data or {},
-            "timestamp": int(time.time() * 1000),
-        }
-        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(json.dumps(payload, ensure_ascii=False) + "\n")
-    except Exception:
-        pass
-# #endregion
+        _XVFB_PROC = subprocess.Popen(
+            [xvfb, display, "-screen", "0", "1920x1080x24", "-ac", "+extension", "RANDR"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        os.environ["DISPLAY"] = display
+        time.sleep(0.8)
+        logger.success(f"تم تشغيل Xvfb على {display} — المتصفح سيُفتح بواجهة نظامية")
+    except Exception as e:
+        logger.error(f"فشل تشغيل Xvfb: {e}")
+        os.environ["DISPLAY"] = display
+
+
+def find_system_chrome() -> Optional[str]:
+    """مسار كروم/كروميوم النظامي على Linux أو Windows."""
+    candidates = [
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/google-chrome",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+        "/snap/bin/chromium",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
 
 
 def request_stop_bot():
@@ -123,14 +154,19 @@ def parse_proxy(raw: str) -> Optional[Dict[str, str]]:
 
 
 async def launch_browser(playwright, config: "Config"):
+    # على السيرفر: متصفح نظامي بواجهة (headed) عبر Xvfb
+    if os.name != "nt" and not config.browser_headless:
+        ensure_virtual_display()
+
     args = list(config.browser_args)
-    # headless الجديد أقل انكشافاً من القديم
     if config.browser_headless:
         args = [a for a in args if not a.startswith("--headless")]
         args.append("--headless=new")
+    else:
+        args = [a for a in args if not a.startswith("--headless")]
 
     kwargs = {
-        "headless": config.browser_headless,
+        "headless": bool(config.browser_headless),
         "args": args,
     }
     if getattr(config, "proxy_enabled", False) and getattr(config, "proxy", ""):
@@ -144,15 +180,16 @@ async def launch_browser(playwright, config: "Config"):
         else:
             logger.warning("صيغة البروكسي غير صحيحة — بدون بروكسي")
 
-    edge = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-    chrome_win = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    if os.path.exists(edge):
-        kwargs["executable_path"] = edge
-        browser = await playwright.chromium.launch(**kwargs)
-    elif os.path.exists(chrome_win):
-        kwargs["executable_path"] = chrome_win
+    chrome = find_system_chrome()
+    if chrome:
+        kwargs["executable_path"] = chrome
+        logger.info(
+            f"متصفح نظامي: {chrome} | "
+            f"وضع={'headless' if config.browser_headless else 'واجهة (headed)'}"
+        )
         browser = await playwright.chromium.launch(**kwargs)
     else:
+        logger.warning("لم يُعثر على Chrome النظامي — استخدام Chromium من Playwright")
         try:
             browser = await playwright.chromium.launch(channel="chrome", **kwargs)
         except Exception:
@@ -228,7 +265,7 @@ def load_settings() -> dict:
         "enable_repost": True,
         "watch_count": 3,
         "max_browsers": 1,
-        "browser_headless": True,
+        "browser_headless": False,  # متصفح نظامي بواجهة على VPS
         "imap_host": "imap.hostinger.com",
         "imap_port": 993,
         "otp_timeout": 90,
@@ -265,7 +302,7 @@ class Config:
     comment_all_in_order: bool = True
     comment_texts: List[str] = field(default_factory=list)
     max_browsers: int = 1
-    browser_headless: bool = True
+    browser_headless: bool = False  # واجهة نظامية (headed) افتراضياً
     max_check_attempts: int = 1
     proxy_enabled: bool = True
     proxy: str = DEFAULT_PROXY
@@ -332,7 +369,10 @@ class Config:
         cfg.enable_repost = bool(s.get("enable_repost", True))
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
-        cfg.browser_headless = bool(s.get("browser_headless", True))
+        cfg.browser_headless = bool(s.get("browser_headless", False))
+        # على Linux: افتح متصفح نظامي بواجهة (إلا إذا IG_HEADLESS=1)
+        if os.name != "nt" and os.environ.get("IG_HEADLESS", "").strip() not in ("1", "true", "yes"):
+            cfg.browser_headless = False
         cfg.proxy = (s.get("proxy") or "").strip() or DEFAULT_PROXY
         # إذا في بروكسي → شغّالو (إلا إذا صراحة proxy_enabled=false وبلا قيمة)
         if "proxy_enabled" in s:
@@ -1773,10 +1813,16 @@ async def run_bot(config: Config = None) -> dict:
     if not (config.proxy or "").strip():
         config.proxy = DEFAULT_PROXY
     config.proxy_enabled = True
+    # على السيرفر: متصفح نظامي headed دائماً
+    if os.name != "nt" and os.environ.get("IG_HEADLESS", "").strip() not in ("1", "true", "yes"):
+        config.browser_headless = False
+        ensure_virtual_display()
     try:
         s = load_settings()
         s["proxy_enabled"] = True
         s["proxy"] = config.proxy
+        if os.name != "nt":
+            s["browser_headless"] = False
         save_settings(s)
     except Exception:
         pass
@@ -1798,6 +1844,10 @@ async def run_bot(config: Config = None) -> dict:
     logger.info(f"👥 متصفحات متوازية: {config.max_browsers}")
     logger.info(f"📧 OTP تلقائي: {'نعم' if config.auto_otp else 'لا'}")
     logger.info(f"🔑 إعادة دخول إجبارية: {'نعم' if config.force_relogin else 'لا (استخدام الجلسات)'}")
+    logger.info(
+        f"🖥️ المتصفح: {'headless' if config.browser_headless else 'نظامي headed'} "
+        f"| DISPLAY={os.environ.get('DISPLAY', '(لا)')}"
+    )
     if config.proxy_enabled and config.proxy:
         parsed = parse_proxy(config.proxy)
         server = (parsed or {}).get("server", config.proxy)

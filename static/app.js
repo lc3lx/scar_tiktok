@@ -61,7 +61,7 @@ function fillSettings(s, comments) {
   document.getElementById("shareEnabled").checked = s.enable_sharing !== false;
   document.getElementById("commentEnabled").checked = !!s.enable_commenting;
   document.getElementById("autoOtp").checked = s.auto_otp !== false;
-  document.getElementById("headless").checked = s.browser_headless !== false;
+  document.getElementById("headless").checked = !!s.browser_headless;
   document.getElementById("proxyEnabled").checked = s.proxy_enabled !== false;
   document.getElementById("proxy").value = s.proxy || "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK";
   document.getElementById("forceRelogin").checked = !!s.force_relogin;

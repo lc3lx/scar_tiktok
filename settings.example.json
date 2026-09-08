@@ -9,7 +9,7 @@
   "enable_sharing": true,
   "watch_count": 3,
   "max_browsers": 1,
-  "browser_headless": true,
+  "browser_headless": false,
   "imap_host": "imap.hostinger.com",
   "imap_port": 993,
   "otp_timeout": 90,

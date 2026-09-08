@@ -207,7 +207,13 @@ def fetch_tiktok_otp(
             )
         return best_code
     except imaplib.IMAP4.error as e:
+        err = str(e)
         logger.error(f"[{email_addr}] خطأ IMAP Hostinger: {e}")
+        if "AUTHENTICATIONFAILED" in err.upper() or "Invalid credentials" in err:
+            logger.error(
+                f"[{email_addr}] باسورد صندوق الميل غلط أو الإيميل مو Hostinger — "
+                f"حدّثه من لوحة «حسابات Hostinger» ثم احفظ"
+            )
     except Exception as e:
         logger.error(f"[{email_addr}] فشل جلب OTP: {type(e).__name__}: {e}")
     return None
