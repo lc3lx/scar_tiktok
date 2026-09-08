@@ -15,7 +15,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-08-instagram-v1"
+BOT_VERSION = "2026-09-09-instagram-v2"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -881,59 +881,213 @@ class InstagramChecker:
                 continue
         return False
 
+    async def log_page_state(self, page: Page, account: str, tag: str) -> None:
+        try:
+            info = await page.evaluate(
+                """() => ({
+                    url: location.href,
+                    title: document.title,
+                    inputs: Array.from(document.querySelectorAll('input')).slice(0,12).map(i => ({
+                      name: i.name, type: i.type, ph: i.placeholder,
+                      visible: !!(i.offsetParent || i.getClientRects().length)
+                    })),
+                    buttons: Array.from(document.querySelectorAll('button')).slice(0,10).map(b => ({
+                      text: (b.innerText||'').trim().slice(0,40),
+                      visible: !!(b.offsetParent || b.getClientRects().length)
+                    })),
+                    body: (document.body?.innerText||'').replace(/\\s+/g,' ').slice(0,450)
+                })"""
+            )
+            logger.warning(f"[{account}] {tag}: {info}")
+            # #region agent log
+            _dbg("LOGIN", "main.py:log_page_state", tag, {"account": account, "info": info})
+            # #endregion
+        except Exception as e:
+            logger.warning(f"[{account}] {tag} failed: {e} | URL={page.url}")
+
+    async def dismiss_cookie_banners(self, page: Page) -> None:
+        for sel in [
+            'button:has-text("Allow all cookies")',
+            'button:has-text("Allow all")',
+            'button:has-text("Accept all")',
+            'button:has-text("Accept")',
+            'button:has-text("Only allow essential")',
+            'button:has-text("Decline optional")',
+            '[role="dialog"] button:has-text("Allow")',
+        ]:
+            try:
+                b = page.locator(sel).first
+                if await b.count() > 0 and await b.is_visible():
+                    await b.click(force=True, timeout=2000)
+                    await asyncio.sleep(0.8)
+            except Exception:
+                continue
+
+    async def wait_for_login_form(self, page: Page, account: str, timeout_s: int = 35):
+        """ينتظر ظهور حقول الدخول مع عدة محاولات تنقل."""
+        deadline = time.time() + timeout_s
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            await self.dismiss_cookie_banners(page)
+
+            # روابط Log in على الصفحة الرئيسية
+            for sel in [
+                'a[href="/accounts/login/"]',
+                'a[href*="/accounts/login"]',
+                'button:has-text("Log in")',
+                'a:has-text("Log in")',
+            ]:
+                try:
+                    a = page.locator(sel).first
+                    if await a.count() > 0 and await a.is_visible():
+                        # لا تضغط إذا الحقول ظاهرة أصلاً
+                        if await page.locator('input[name="username"]').count() == 0:
+                            await a.click(force=True)
+                            await asyncio.sleep(2)
+                except Exception:
+                    pass
+
+            user_sels = [
+                'input[name="username"]',
+                'input[aria-label="Phone number, username, or email"]',
+                'input[aria-label*="username" i]',
+                'input[placeholder*="username" i]',
+                'input[autocomplete="username"]',
+            ]
+            pass_sels = [
+                'input[name="password"]',
+                'input[aria-label="Password"]',
+                'input[type="password"]',
+                'input[autocomplete="current-password"]',
+            ]
+            user_input = None
+            pass_input = None
+            for sel in user_sels:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        user_input = loc
+                        break
+                except Exception:
+                    continue
+            for sel in pass_sels:
+                loc = page.locator(sel).first
+                try:
+                    if await loc.count() > 0 and await loc.is_visible():
+                        pass_input = loc
+                        break
+                except Exception:
+                    continue
+
+            if user_input and pass_input:
+                return user_input, pass_input
+
+            if await self.is_logged_in(page):
+                return None, None
+
+            # صفحات حظر / خطأ شائعة
+            try:
+                body = (await page.inner_text("body"))[:800].lower()
+                if any(x in body for x in ("sorry, this page", "something went wrong", "try again later", "unavailable")):
+                    logger.error(f"[{account}] صفحة خطأ/حظر من إنستغرام — غالباً البروكسي")
+                    await self.log_page_state(page, account, "ig-blocked")
+                    return None, None
+            except Exception:
+                pass
+
+            if attempt in (1, 3, 6):
+                logger.info(f"[{account}] انتظار فورم الدخول... URL={page.url}")
+                # إعادة فتح صفحة الدخول
+                try:
+                    await page.goto(
+                        "https://www.instagram.com/accounts/login/?source=auth_switcher",
+                        wait_until="domcontentloaded",
+                        timeout=45000,
+                    )
+                except Exception:
+                    pass
+                await asyncio.sleep(2)
+
+            await asyncio.sleep(1.5)
+
+        await self.log_page_state(page, account, "login-form-timeout")
+        return None, None
+
     async def login(self, page: Page, account: Dict) -> bool:
         login = account["email"]
         password = account["password"]
         mailbox = account.get("mailbox_email") or login
         mailbox_pass = account.get("email_password") or password
 
-        await self.safe_goto(page, "https://www.instagram.com/accounts/login/", login)
+        logger.info(f"[{login}] إحماء إنستغرام ثم صفحة الدخول...")
+        await self.safe_goto(page, "https://www.instagram.com/", login)
+        await self.dismiss_cookie_banners(page)
         await asyncio.sleep(2)
 
-        # cookie banners
-        for sel in ['button:has-text("Allow all cookies")', 'button:has-text("Accept")']:
-            try:
-                b = page.locator(sel).first
-                if await b.count() > 0 and await b.is_visible():
-                    await b.click(force=True)
-            except Exception:
-                pass
+        if await self.is_logged_in(page):
+            logger.success(f"[{login}] مسجّل مسبقاً")
+            return True
 
-        user_input = page.locator('input[name="username"]').first
-        pass_input = page.locator('input[name="password"]').first
-        if await user_input.count() == 0 or await pass_input.count() == 0:
+        await self.safe_goto(page, "https://www.instagram.com/accounts/login/", login)
+        await asyncio.sleep(2)
+        await self.dismiss_cookie_banners(page)
+
+        user_input, pass_input = await self.wait_for_login_form(page, login, timeout_s=40)
+        if user_input is None and pass_input is None:
             if await self.is_logged_in(page):
                 return True
-            logger.warning(f"[{login}] فورم الدخول غير ظاهر")
+            logger.warning(f"[{login}] فورم الدخول غير ظاهر | URL={page.url}")
             return False
 
         after_ts = time.time() - 2
-        await user_input.fill("")
-        await user_input.type(login, delay=20)
-        await asyncio.sleep(0.3)
-        await pass_input.fill("")
-        await pass_input.type(password, delay=20)
-        await asyncio.sleep(0.4)
+        try:
+            await user_input.click(force=True)
+            await user_input.fill("")
+            await user_input.type(login, delay=25)
+            await asyncio.sleep(0.4)
+            await pass_input.click(force=True)
+            await pass_input.fill("")
+            await pass_input.type(password, delay=25)
+            await asyncio.sleep(0.5)
+        except Exception as e:
+            logger.warning(f"[{login}] فشل تعبئة الفورم: {e}")
+            await self.log_page_state(page, login, "fill-fail")
+            return False
 
-        submit = page.locator('button[type="submit"]').first
-        await submit.click()
-        logger.info(f"[{login}] تم ضغط Log in")
+        submitted = False
+        for sel in [
+            'button[type="submit"]',
+            'button:has-text("Log in")',
+            'div[role="button"]:has-text("Log in")',
+        ]:
+            btn = page.locator(sel).first
+            try:
+                if await btn.count() > 0 and await btn.is_visible():
+                    await btn.click(timeout=5000)
+                    submitted = True
+                    break
+            except Exception:
+                try:
+                    await btn.click(force=True)
+                    submitted = True
+                    break
+                except Exception:
+                    continue
+        if not submitted:
+            await page.keyboard.press("Enter")
+
+        logger.info(f"[{login}] تم ضغط Log in — انتظار...")
         await asyncio.sleep(4)
 
-        # dismiss save info / notifications
-        for _ in range(3):
+        for _ in range(4):
             for sel in [
                 'button:has-text("Not Now")',
                 'button:has-text("Not now")',
-                'button:has-text("Save info")',  # sometimes we skip
             ]:
                 try:
                     b = page.locator(sel).first
                     if await b.count() > 0 and await b.is_visible():
-                        txt = (await b.inner_text() or "").lower()
-                        if "save info" in txt:
-                            # prefer Not Now
-                            continue
                         await b.click(force=True)
                         await asyncio.sleep(1)
                 except Exception:
@@ -941,9 +1095,8 @@ class InstagramChecker:
 
         await self.fill_otp_if_needed(page, login, mailbox, mailbox_pass, after_ts)
 
-        for _ in range(20):
+        for i in range(30):
             if await self.is_logged_in(page):
-                # dismiss prompts
                 for sel in ['button:has-text("Not Now")', 'button:has-text("Not now")']:
                     try:
                         b = page.locator(sel).first
@@ -954,8 +1107,23 @@ class InstagramChecker:
                 logger.success(f"[{login}] تم تسجيل الدخول")
                 return True
             await self.fill_otp_if_needed(page, login, mailbox, mailbox_pass, after_ts)
+            # خطأ كلمة مرور / حظر
+            try:
+                body = (await page.inner_text("body"))[:1200].lower()
+                if "sorry, your password was incorrect" in body or "incorrect" in body and "password" in body:
+                    logger.error(f"[{login}] كلمة المرور غير صحيحة")
+                    return False
+                if "try again later" in body or "suspicious" in body:
+                    logger.error(f"[{login}] إنستغرام رفض الدخول مؤقتاً (بروكسي/حظر)")
+                    await self.log_page_state(page, login, "login-rejected")
+                    return False
+            except Exception:
+                pass
+            if i % 5 == 0:
+                logger.info(f"[{login}] انتظار اكتمال الدخول... ({i*2}ث) URL={page.url}")
             await asyncio.sleep(2)
 
+        await self.log_page_state(page, login, "login-timeout")
         logger.warning(f"[{login}] فشل تسجيل الدخول | URL={page.url}")
         return False
 
@@ -1135,6 +1303,11 @@ async def run_bot(config: Config = None) -> dict:
     logger.info("=" * 60)
     logger.info(f"🎯 منشور/ريل: {config.target_video_url or '(غير محدد)'}")
     logger.info(f"👤 بروفايل: {config.profile_url or '(غير محدد)'}")
+    if config.profile_url and "tiktok.com" in config.profile_url.lower():
+        logger.error(
+            "⚠️ رابط البروفايل ما زال تيك توك! غيّره في اللوحة إلى رابط إنستغرام "
+            "مثل https://www.instagram.com/username/"
+        )
     logger.info(f"🎮 الوضع: {config.bot_mode}")
     logger.info(f"💬 تعليقات متبقية: {remaining_count()}")
     logger.info(f"👥 متصفحات متوازية: {config.max_browsers}")
