@@ -16,9 +16,9 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v12"
+BOT_VERSION = "2026-09-09-instagram-v13"
 
-# بروكسي افتراضي — مفعّل دائماً إلا إذا غيّرته من اللوحة
+# بروكسي محفوظ للإعداد اليدوي فقط — افتراضياً مطفي
 DEFAULT_PROXY = "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK"
 _XVFB_PROC = None
 
@@ -277,7 +277,7 @@ def load_settings() -> dict:
         "auto_otp": True,
         "dashboard_host": "0.0.0.0",
         "dashboard_port": 5050,
-        "proxy_enabled": True,
+        "proxy_enabled": False,
         "proxy": DEFAULT_PROXY,
         "force_relogin": False,
     }
@@ -309,8 +309,8 @@ class Config:
     max_browsers: int = 1
     browser_headless: bool = False  # واجهة نظامية (headed) افتراضياً
     max_check_attempts: int = 1
-    proxy_enabled: bool = True
-    proxy: str = DEFAULT_PROXY
+    proxy_enabled: bool = False
+    proxy: str = ""
     force_relogin: bool = False
     page_timeout: int = 45
     action_delay: float = 1.0
@@ -378,14 +378,8 @@ class Config:
         # على Linux: افتح متصفح نظامي بواجهة (إلا إذا IG_HEADLESS=1)
         if os.name != "nt" and os.environ.get("IG_HEADLESS", "").strip() not in ("1", "true", "yes"):
             cfg.browser_headless = False
-        cfg.proxy = (s.get("proxy") or "").strip() or DEFAULT_PROXY
-        # إذا في بروكسي → شغّالو (إلا إذا صراحة proxy_enabled=false وبلا قيمة)
-        if "proxy_enabled" in s:
-            cfg.proxy_enabled = bool(s.get("proxy_enabled"))
-        else:
-            cfg.proxy_enabled = True
-        if cfg.proxy and s.get("proxy_enabled") is not False:
-            cfg.proxy_enabled = True
+        cfg.proxy = (s.get("proxy") or "").strip()
+        cfg.proxy_enabled = bool(s.get("proxy_enabled", False))
         cfg.force_relogin = bool(s.get("force_relogin", False))
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = (s.get("imap_host") or "imap.hostinger.com").strip()
@@ -1894,22 +1888,20 @@ async def run_bot(config: Config = None) -> dict:
         or os.environ.get("TIKTOK_PROXY")
         or ""
     ).strip()
-    if env_proxy:
+    # البروكسي مطفي افتراضياً — لا تفعّله من البيئة إلا إذا IG_FORCE_PROXY=1
+    if env_proxy and os.environ.get("IG_FORCE_PROXY", "").strip() in ("1", "true", "yes"):
         config.proxy = env_proxy
         config.proxy_enabled = True
+    else:
+        config.proxy_enabled = False
 
-    # إجبار تشغيل البروكسي — ما عاد يتعطل بالغلط
-    if not (config.proxy or "").strip():
-        config.proxy = DEFAULT_PROXY
-    config.proxy_enabled = True
     # على السيرفر: متصفح نظامي headed دائماً
     if os.name != "nt" and os.environ.get("IG_HEADLESS", "").strip() not in ("1", "true", "yes"):
         config.browser_headless = False
         ensure_virtual_display()
     try:
         s = load_settings()
-        s["proxy_enabled"] = True
-        s["proxy"] = config.proxy
+        s["proxy_enabled"] = False
         if os.name != "nt":
             s["browser_headless"] = False
         # لا تفرض login كل تشغيل — يسبب 429

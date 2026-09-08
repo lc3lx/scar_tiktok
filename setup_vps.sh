@@ -41,12 +41,12 @@ python3 - <<'PY'
 import json
 p="settings.json"
 s=json.load(open(p,encoding="utf-8"))
-s["proxy_enabled"]=True
-s["proxy"]="178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK"
+s["proxy_enabled"]=False
+s["proxy"]=""
 s["browser_headless"]=False
 s["force_relogin"]=False
 json.dump(s, open(p,"w",encoding="utf-8"), ensure_ascii=False, indent=2)
-print("settings: headed + proxy ON")
+print("settings: headed + proxy OFF")
 PY
 
 echo "جاهز. شغّل:"

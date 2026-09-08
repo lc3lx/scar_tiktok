@@ -15,8 +15,8 @@
   "otp_timeout": 90,
   "auto_otp": true,
   "force_relogin": false,
-  "proxy_enabled": true,
-  "proxy": "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK",
+  "proxy_enabled": false,
+  "proxy": "",
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5050
 }
