@@ -16,7 +16,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v11"
+BOT_VERSION = "2026-09-09-instagram-v12"
 
 # بروكسي افتراضي — مفعّل دائماً إلا إذا غيّرته من اللوحة
 DEFAULT_PROXY = "178.93.74.74:46459:ilIXTcXCyPrJyYm:7LMX2TY1odthIoK"
@@ -26,6 +26,11 @@ STOP_BOT_FLAG = False
 ACTIVE_BROWSERS: List[Any] = []
 _BOT_LOOP = None
 LOGIN_OTP_LOCK: Optional[asyncio.Lock] = None
+
+
+def _dbg(*_args, **_kwargs):
+    """debug stub — لا يفعل شيئاً (كان يسبب NameError بعد الحذف)."""
+    return None
 
 
 def ensure_virtual_display() -> None:
@@ -1189,14 +1194,78 @@ class InstagramChecker:
         self.stats = stats
         self.file_handler = FileHandler(config)
 
-    async def safe_goto(self, page: Page, url: str, account: str) -> bool:
-        try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            await asyncio.sleep(2)
+    async def page_is_rate_limited(self, page: Page) -> bool:
+        url = (page.url or "").lower()
+        if "chrome-error://" in url:
             return True
-        except Exception as e:
-            logger.warning(f"[{account}] تنبيه فتح {url}: {type(e).__name__}: {e}")
-            return "instagram.com" in (page.url or "")
+        try:
+            body = (await page.inner_text("body"))[:800].lower()
+        except Exception:
+            body = ""
+        markers = (
+            "http error 429",
+            "429",
+            "too many requests",
+            "please wait a few minutes",
+            "try again later",
+            "this page isn’t working",
+            "this page isn't working",
+        )
+        return any(m in body for m in markers)
+
+    async def wait_out_rate_limit(self, page: Page, account: str, attempt: int = 1) -> bool:
+        """عند 429: انتظر ثم أعد المحاولة بدل الفشل فوراً."""
+        wait_s = min(45 + attempt * 30, 180)
+        logger.error(
+            f"[{account}] إنستغرام رجّع HTTP 429 (طلبات كثيرة / البروكسي محروق مؤقتاً). "
+            f"انتظار {wait_s}ث ثم إعادة المحاولة..."
+        )
+        await asyncio.sleep(wait_s)
+        for url in (
+            "https://www.instagram.com/",
+            "https://i.instagram.com/",
+            "https://www.instagram.com/accounts/login/?hl=en",
+        ):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                logger.warning(f"[{account}] إعادة بعد 429 فشلت على {url}: {e}")
+            await asyncio.sleep(3 + attempt)
+            if not await self.page_is_rate_limited(page) and "chrome-error://" not in (page.url or ""):
+                logger.success(f"[{account}] خرجنا من 429 — الصفحة: {page.url}")
+                return True
+        return False
+
+    async def safe_goto(self, page: Page, url: str, account: str) -> bool:
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                await asyncio.sleep(2)
+                if await self.page_is_rate_limited(page):
+                    ok = await self.wait_out_rate_limit(page, account, attempt)
+                    if ok:
+                        try:
+                            await page.goto(url, wait_until="domcontentloaded", timeout=45000)
+                        except Exception as e:
+                            last_err = e
+                            continue
+                        return "instagram.com" in (page.url or "")
+                    continue
+                return True
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                logger.warning(f"[{account}] تنبيه فتح {url}: {type(e).__name__}: {e}")
+                if "ERR_HTTP_RESPONSE_CODE_FAILURE" in msg or "429" in msg:
+                    await self.wait_out_rate_limit(page, account, attempt)
+                    continue
+                if "instagram.com" in (page.url or ""):
+                    return True
+                await asyncio.sleep(3 * attempt)
+        if last_err:
+            logger.error(f"[{account}] فشل فتح {url} بعد عدة محاولات")
+        return "instagram.com" in (page.url or "")
 
     async def is_logged_in(self, page: Page) -> bool:
         """تحقق صارم — لا نعتبر أي صفحة إنستغرام دخولاً ناجحاً."""
@@ -1417,6 +1486,12 @@ class InstagramChecker:
             attempt += 1
             await self.dismiss_cookie_banners(page)
 
+            if await self.page_is_rate_limited(page):
+                if not await self.wait_out_rate_limit(page, account, attempt):
+                    await self.log_page_state(page, account, "rate-limit-429")
+                    return None, None
+                continue
+
             if await self.page_looks_blank(page) and attempt in (2, 5):
                 await self.recover_blank_login_page(page, account)
 
@@ -1516,6 +1591,14 @@ class InstagramChecker:
         await self.dismiss_cookie_banners(page)
         await asyncio.sleep(2)
 
+        if await self.page_is_rate_limited(page):
+            if not await self.wait_out_rate_limit(page, login, 1):
+                logger.error(
+                    f"[{login}] ما زال 429 بعد الانتظار — وقف التشغيل 10–20 دقيقة، "
+                    f"أو بدّل بروكسي، ولا تشغّل إجبار login كل دقيقة"
+                )
+                return False
+
         if await self.page_looks_blank(page):
             ok = await self.recover_blank_login_page(page, login)
             if not ok:
@@ -1529,10 +1612,16 @@ class InstagramChecker:
         await asyncio.sleep(3)
         await self.dismiss_cookie_banners(page)
 
+        if await self.page_is_rate_limited(page):
+            if not await self.wait_out_rate_limit(page, login, 2):
+                return False
+
         user_input, pass_input = await self.wait_for_login_form(page, login, timeout_s=55)
         if user_input is None and pass_input is None:
             if await self.is_logged_in(page):
                 return True
+            if await self.page_is_rate_limited(page):
+                logger.error(f"[{login}] فورم الدخول محجوب بـ 429 — انتظر ثم أعد المحاولة")
             logger.warning(f"[{login}] فورم الدخول غير ظاهر | URL={page.url}")
             return False
 
@@ -1823,6 +1912,9 @@ async def run_bot(config: Config = None) -> dict:
         s["proxy"] = config.proxy
         if os.name != "nt":
             s["browser_headless"] = False
+        # لا تفرض login كل تشغيل — يسبب 429
+        if s.get("force_relogin"):
+            s["force_relogin"] = False
         save_settings(s)
     except Exception:
         pass
