@@ -51,7 +51,10 @@ function fillComments(c) {
 function fillSettings(s, comments) {
   document.getElementById("videoUrl").value = s.target_video_url || "";
   document.getElementById("profileUrl").value = s.profile_url || "";
-  document.getElementById("botMode").value = s.bot_mode || "watch";
+  let mode = s.bot_mode || "full";
+  if (["watch", "watch_comment"].includes(mode)) mode = "profile";
+  if (mode === "comment") mode = "video";
+  document.getElementById("botMode").value = mode;
   document.getElementById("likeEnabled").checked = !!s.enable_liking;
   document.getElementById("shareEnabled").checked = s.enable_sharing !== false;
   document.getElementById("commentEnabled").checked = !!s.enable_commenting;

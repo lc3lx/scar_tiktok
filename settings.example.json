@@ -1,13 +1,13 @@
 {
   "target_video_url": "",
   "profile_url": "",
-  "bot_mode": "watch",
+  "bot_mode": "full",
   "comment_texts": [],
   "comment_all_in_order": true,
   "enable_liking": true,
   "enable_commenting": true,
   "enable_sharing": true,
-  "watch_count": 0,
+  "watch_count": 3,
   "max_browsers": 1,
   "browser_headless": true,
   "imap_host": "imap.hostinger.com",
@@ -16,7 +16,7 @@
   "auto_otp": true,
   "proxy_enabled": false,
   "proxy": "",
-  "force_relogin": false,
+  "force_relogin": true,
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5050
 }

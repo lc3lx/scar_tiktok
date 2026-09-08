@@ -21,7 +21,17 @@ OTP_PATTERNS = [
     r"\b([0-9]{4})\b",
 ]
 
-TIKTOK_SENDERS = ("tiktok", "noreply@", "account@", "mail.tiktok")
+TIKTOK_SENDERS = (
+    "instagram",
+    "mail.instagram",
+    "facebook",
+    "noreply@",
+    "security@",
+    "tiktok",  # legacy
+    "account@",
+    "mail.tiktok",
+)
+OTP_SENDERS = TIKTOK_SENDERS  # alias
 IMAP_FOLDERS = ("INBOX", "Junk", "Spam", "Junk E-mail", "Bulk Mail")
 
 # أكواد استُخدمت مسبقاً حتى لا يأخذ حساب ثانٍ نفس الرمز من صندوق مشترك
@@ -148,7 +158,9 @@ def fetch_tiktok_otp(
                 delivered = _decode_mime(msg.get("Delivered-To", "")).lower()
                 date_hdr = msg.get("Date")
 
-                if not any(s in sender for s in TIKTOK_SENDERS) and "tiktok" not in subject.lower():
+                if not any(s in sender for s in TIKTOK_SENDERS) and not any(
+                    k in subject.lower() for k in ("instagram", "facebook", "tiktok", "security code", "confirmation")
+                ):
                     continue
 
                 try:

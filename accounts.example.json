@@ -1,7 +1,7 @@
 [
   {
-    "email": "user@example.com",
-    "password": "tiktok_password",
-    "mailbox": "shared@example.com"
+    "email": "instagram_username_or_email",
+    "password": "password_here",
+    "mailbox": "otp@yourdomain.com"
   }
 ]

@@ -1,4 +1,4 @@
-"""لوحة تحكم ويب لبوت تعليقات TikTok — جاهزة لـ VPS."""
+"""لوحة تحكم ويب لبوت إنستغرام — جاهزة لـ VPS."""
 import asyncio
 import os
 import threading
@@ -22,7 +22,7 @@ from main import (
 from comments_pool import peek_status, set_comments
 
 BASE_DIR = Path(__file__).resolve().parent
-LOG_FILE = BASE_DIR / "tiktok_checker.log"
+LOG_FILE = BASE_DIR / "instagram_bot.log"
 
 app = Flask(__name__)
 bot_state = {
@@ -134,16 +134,22 @@ def api_settings():
         elif comments is not None:
             set_comments(comments, replace=replace_comments)
 
+    mode = (data.get("bot_mode") or "full").strip().lower()
+    if mode in ("watch", "watch_comment"):
+        mode = "profile"
+    if mode == "comment":
+        mode = "video"
+
     patch = {
         "target_video_url": (data.get("target_video_url") or "").strip(),
         "profile_url": (data.get("profile_url") or "").strip(),
-        "bot_mode": (data.get("bot_mode") or "watch").strip(),
+        "bot_mode": mode,
         "comment_texts": peek_status()["pending"],
         "comment_all_in_order": bool(data.get("comment_all_in_order", True)),
         "enable_liking": bool(data.get("enable_liking", True)),
         "enable_commenting": bool(data.get("enable_commenting", True)),
         "enable_sharing": bool(data.get("enable_sharing", True)),
-        "watch_count": int(data.get("watch_count", 0) or 0),
+        "watch_count": int(data.get("watch_count", 3) or 3),
         "max_browsers": max(1, int(data.get("max_browsers", 1) or 1)),
         "browser_headless": bool(data.get("browser_headless", True)),
         "proxy_enabled": bool(data.get("proxy_enabled", False)),
@@ -296,12 +302,18 @@ def api_start():
         return jsonify({"ok": False, "error": "already_running"}), 409
 
     settings = load_settings()
-    mode = settings.get("bot_mode", "watch")
+    mode = (settings.get("bot_mode") or "full").lower()
     if mode in ("watch", "watch_comment"):
-        if not settings.get("profile_url") and not settings.get("target_video_url"):
-            return jsonify({"ok": False, "error": "no_profile_url"}), 400
-    elif not settings.get("target_video_url"):
+        mode = "profile"
+    if mode == "comment":
+        mode = "video"
+
+    if mode in ("profile", "full") and not settings.get("profile_url"):
+        return jsonify({"ok": False, "error": "no_profile_url"}), 400
+    if mode in ("video", "full") and mode == "video" and not settings.get("target_video_url"):
         return jsonify({"ok": False, "error": "no_video_url"}), 400
+    if mode == "full" and not settings.get("profile_url") and not settings.get("target_video_url"):
+        return jsonify({"ok": False, "error": "no_target"}), 400
     if not load_accounts_json():
         return jsonify({"ok": False, "error": "no_accounts"}), 400
 
@@ -325,7 +337,7 @@ if __name__ == "__main__":
     host = os.environ.get("HOST") or settings.get("dashboard_host") or "0.0.0.0"
     port = int(os.environ.get("PORT") or settings.get("dashboard_port") or 5050)
     print("=" * 50)
-    print("  TikTok Bot Dashboard")
+    print("  Instagram Bot Dashboard")
     print(f"  http://{host}:{port}")
     print("  (VPS: افتح البورت في الجدار الناري)")
     print("=" * 50)

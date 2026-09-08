@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: "scar-tiktok",
+      name: "scar-instagram",
       script: "app.py",
       interpreter: "/home/web/tik/.venv/bin/python",
       cwd: "/home/web/tik",

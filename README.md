@@ -1,47 +1,58 @@
-# scar_tiktok
+# Instagram Engagement Bot
 
-بوت TikTok قابل للتحكم بالكامل من لوحة ويب — جاهز للرفع على VPS للزبون.
+بوت إنستغرام مع لوحة تحكم Flask — جاهز لـ VPS عبر PM2.
 
-## ماذا يتحكم الزبون من الواجهة؟
+## ماذا يفعل؟
 
-- رابط البروفايل / الفيديو ووضع التشغيل
-- لايك / شير / تعليق / OTP / Headless
-- عدد المتصفحات ومهلة OTP و IMAP
-- حسابات Hostinger وحسابات TikTok
-- مجمع التعليقات
-- **تشغيل** و **إيقاف** البوت + مشاهدة اللوقز مباشرة
+- تسجيل دخول بحسابات Instagram (مع OTP من Hostinger عند الحاجة)
+- فتح **بروفايل**: لايك للمنشورات إن لم يكن معجباً، تعليق من المجمع، محاولة Add to story
+- فتح **منشور/ريل محدد**: لايك + تعليق + ستوري/شير
+- إيقاف فوري من الواجهة
 
-## تشغيل على VPS
+## أوضاع التشغيل
+
+| الوضع | الوصف |
+|--------|--------|
+| `full` | بروفايل + منشور محدد |
+| `profile` | بروفايل فقط |
+| `video` | منشور/ريل محدد فقط |
+
+## تشغيل محلي
 
 ```bash
+python -m venv .venv
+# Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 playwright install chromium
-playwright install-deps chromium   # على Linux إن لزم
-```
-
-أنشئ الملفات محلياً (لا تُرفع للـ Git):
-
-```bash
+cp settings.example.json settings.json
 cp accounts.example.json accounts.json
 cp mailboxes.example.json mailboxes.json
-```
-
-ثم:
-
-```bash
 python app.py
 ```
 
-اللوحة تفتح على كل الواجهات افتراضياً: `http://IP:5050`
+افتح: http://127.0.0.1:5050
 
-يمكنك تغيير المنفذ:
+## VPS + PM2
 
 ```bash
-PORT=8080 python app.py
+cd /home/web/tik
+git pull origin main
+source .venv/bin/activate
+pip install -r requirements.txt
+playwright install chromium
+
+# أوقف النسخة القديمة إن وُجدت
+pm2 delete scar-tiktok 2>/dev/null || true
+
+pm2 start ecosystem.config.cjs
+pm2 save
 ```
 
-افتح البورت في الجدار الناري/Security Group.
+الواجهة: `http://YOUR_VPS_IP:5050`
 
-## ملاحظة
+## ملاحظات
 
-الإعدادات تُحفظ في `settings.json` تلقائياً عند التعديل من الواجهة — لا حاجة لتعديل ملفات يدوياً بعد التثبيت الأولي للحسابات.
+- خيار **Add to story** أحياناً غير متاح على ويب إنستغرام؛ البوت يحاول ثم يستخدم Copy link كبديل ويسجّل ذلك.
+- يُفضّل `max_browsers=1` مع صندوق OTP مشترك.
+- لا ترفع `accounts.json` / `mailboxes.json` / `settings.json` إلى Git.
