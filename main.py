@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -15,7 +16,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v6"
+BOT_VERSION = "2026-09-09-instagram-v7"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -267,17 +268,24 @@ class Config:
         "--disable-blink-features=AutomationControlled",
     ])
     browser_context_options: Dict[str, Any] = field(default_factory=lambda: {
-        "viewport": {"width": 1280, "height": 900},
+        "viewport": {"width": 1365, "height": 900},
         "ignore_https_errors": True,
         "java_script_enabled": True,
         "locale": "en-US",
         "timezone_id": "America/New_York",
+        "color_scheme": "light",
+        "device_scale_factor": 1,
+        "has_touch": False,
+        "is_mobile": False,
         "user_agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
             "Chrome/131.0.0.0 Safari/537.36"
         ),
-        "extra_http_headers": {"Accept-Language": "en-US,en;q=0.9"},
+        "extra_http_headers": {
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        },
     })
 
     @classmethod
@@ -408,11 +416,89 @@ def extract_username(url: str) -> Optional[str]:
     return user
 
 
+class Human:
+    """حركات وتأخيرات شبيهة بالإنسان لتقليل كشف الأتمتة."""
+
+    def __init__(self, page: Page):
+        self.page = page
+
+    async def pause(self, lo: float = 0.7, hi: float = 2.2) -> None:
+        await asyncio.sleep(random.uniform(lo, hi))
+
+    async def think(self) -> None:
+        """توقف قصير كأن المستخدم يقرأ."""
+        await self.pause(1.5, 4.0)
+
+    async def read_post(self) -> None:
+        await self.pause(2.5, 6.0)
+
+    async def between_actions(self) -> None:
+        await self.pause(1.8, 4.5)
+
+    async def between_posts(self) -> None:
+        await self.pause(4.0, 11.0)
+
+    async def move_around(self) -> None:
+        try:
+            vp = self.page.viewport_size or {"width": 1280, "height": 900}
+            for _ in range(random.randint(1, 3)):
+                x = random.randint(80, max(120, vp["width"] - 80))
+                y = random.randint(80, max(120, vp["height"] - 80))
+                await self.page.mouse.move(x, y, steps=random.randint(8, 22))
+                await self.pause(0.15, 0.55)
+        except Exception:
+            pass
+
+    async def scroll_feed(self) -> None:
+        try:
+            delta = random.randint(180, 520) * random.choice([1, 1, -1])
+            await self.page.mouse.wheel(0, delta)
+            await self.pause(0.4, 1.2)
+            if random.random() < 0.4:
+                await self.page.mouse.wheel(0, -abs(delta) // 3)
+                await self.pause(0.3, 0.8)
+        except Exception:
+            pass
+
+    async def human_click(self, locator, force: bool = False) -> bool:
+        try:
+            await locator.scroll_into_view_if_needed(timeout=5000)
+            await self.pause(0.2, 0.7)
+            box = await locator.bounding_box()
+            if box and box.get("width", 0) > 2 and box.get("height", 0) > 2:
+                x = box["x"] + box["width"] * random.uniform(0.25, 0.75)
+                y = box["y"] + box["height"] * random.uniform(0.25, 0.75)
+                await self.page.mouse.move(x, y, steps=random.randint(6, 18))
+                await self.pause(0.08, 0.35)
+                await self.page.mouse.click(x, y, delay=random.randint(40, 120))
+                return True
+            if force:
+                await locator.click(force=True, timeout=4000)
+            else:
+                await locator.click(timeout=4000)
+            return True
+        except Exception:
+            try:
+                await locator.click(force=True, timeout=3000)
+                return True
+            except Exception:
+                return False
+
+    async def human_type(self, text: str) -> None:
+        for i, ch in enumerate(text):
+            await self.page.keyboard.type(ch, delay=random.randint(45, 160))
+            if random.random() < 0.07:
+                await self.pause(0.2, 0.7)
+            if i > 0 and i % random.randint(8, 14) == 0:
+                await self.pause(0.15, 0.45)
+
+
 class InstagramBot:
     def __init__(self, page: Page, config: Config, stats: Stats):
         self.page = page
         self.config = config
         self.stats = stats
+        self.human = Human(page)
 
     async def dismiss_overlays(self):
         for sel in [
@@ -538,12 +624,14 @@ class InstagramBot:
             return False
         await self.dismiss_overlays()
         await self.wait_for_post_ready(account, timeout_s=12)
+        await self.human.move_around()
+        await self.human.scroll_feed()
+        await self.human.read_post()
 
         if await self.is_liked():
             logger.info(f"[{account}] اللايك موجود مسبقاً — تخطي")
             return True
 
-        # 1) نقر أزرار Like الشائعة (صورة أو فيديو)
         for sel in [
             'main button:has(svg[aria-label="Like"])',
             'article button:has(svg[aria-label="Like"])',
@@ -555,20 +643,17 @@ class InstagramBot:
         ]:
             try:
                 loc = self.page.locator(sel).first
-                if await loc.count() == 0:
+                if await loc.count() == 0 or not await loc.is_visible():
                     continue
-                if not await loc.is_visible():
-                    continue
-                await loc.click(force=True, timeout=4000)
-                await asyncio.sleep(1.2)
-                if await self.is_liked():
-                    await self.stats.increment("likes")
-                    logger.success(f"[{account}] تم عمل لايك")
-                    return True
+                if await self.human.human_click(loc):
+                    await self.human.pause(1.0, 2.2)
+                    if await self.is_liked():
+                        await self.stats.increment("likes")
+                        logger.success(f"[{account}] تم عمل لايك")
+                        return True
             except Exception:
                 continue
 
-        # 2) JS click على أول Like ظاهر
         try:
             clicked = await self.page.evaluate(
                 """() => {
@@ -583,7 +668,7 @@ class InstagramBot:
                     return true;
                 }"""
             )
-            await asyncio.sleep(1.2)
+            await self.human.pause(1.0, 2.0)
             if clicked and await self.is_liked():
                 await self.stats.increment("likes")
                 logger.success(f"[{account}] تم عمل لايك (JS)")
@@ -591,7 +676,6 @@ class InstagramBot:
         except Exception:
             pass
 
-        # 3) double-click على الصورة/الفيديو
         try:
             media = self.page.locator(
                 'article video, article img, main video, div[role="dialog"] video, div[role="dialog"] img'
@@ -599,10 +683,12 @@ class InstagramBot:
             if await media.count() > 0 and await media.is_visible():
                 box = await media.bounding_box()
                 if box:
-                    x = box["x"] + box["width"] / 2
-                    y = box["y"] + box["height"] / 2
-                    await self.page.mouse.dblclick(x, y)
-                    await asyncio.sleep(1.5)
+                    x = box["x"] + box["width"] * random.uniform(0.4, 0.6)
+                    y = box["y"] + box["height"] * random.uniform(0.4, 0.6)
+                    await self.page.mouse.move(x, y, steps=random.randint(8, 16))
+                    await self.human.pause(0.2, 0.5)
+                    await self.page.mouse.dblclick(x, y, delay=random.randint(50, 120))
+                    await self.human.pause(1.2, 2.5)
                     if await self.is_liked():
                         await self.stats.increment("likes")
                         logger.success(f"[{account}] تم عمل لايك (double-click على الوسائط)")
@@ -625,6 +711,8 @@ class InstagramBot:
 
         await self.dismiss_overlays()
         await self.wait_for_post_ready(account, timeout_s=10)
+        await self.human.between_actions()
+        await self.human.move_around()
 
         async def find_box():
             sels = [
@@ -652,7 +740,6 @@ class InstagramBot:
 
         box = await find_box()
         if not box:
-            # افتح أيقونة التعليق (مهم للريل/الفيديو)
             for sel in [
                 'button:has(svg[aria-label="Comment"])',
                 'svg[aria-label="Comment"]',
@@ -661,15 +748,14 @@ class InstagramBot:
                 try:
                     cbtn = self.page.locator(sel).first
                     if await cbtn.count() > 0 and await cbtn.is_visible():
-                        await cbtn.click(force=True)
-                        await asyncio.sleep(1.8)
+                        await self.human.human_click(cbtn)
+                        await self.human.pause(1.2, 2.5)
                         break
                 except Exception:
                     continue
             box = await find_box()
 
         if not box:
-            # JS: ركّز أي textbox ظاهر
             try:
                 focused = await self.page.evaluate(
                     """() => {
@@ -687,7 +773,7 @@ class InstagramBot:
                     }"""
                 )
                 if focused:
-                    await asyncio.sleep(0.5)
+                    await self.human.pause(0.4, 0.9)
                     box = await find_box()
             except Exception:
                 pass
@@ -698,17 +784,14 @@ class InstagramBot:
             return False
 
         try:
-            await box.click(force=True)
-            await asyncio.sleep(0.3)
+            await self.human.human_click(box)
+            await self.human.pause(0.3, 0.8)
             try:
                 await box.fill("")
-                await box.fill(text)
             except Exception:
-                try:
-                    await box.type(text, delay=35)
-                except Exception:
-                    await self.page.keyboard.type(text, delay=35)
-            await asyncio.sleep(0.6)
+                pass
+            await self.human.human_type(text)
+            await self.human.pause(0.6, 1.4)
 
             posted = False
             for sel in [
@@ -725,16 +808,17 @@ class InstagramBot:
                         disabled = await btn.get_attribute("aria-disabled")
                         if disabled == "true":
                             continue
-                        await btn.click(force=True)
+                        await self.human.human_click(btn)
                         posted = True
                         break
                 except Exception:
                     continue
             if not posted:
+                await self.human.pause(0.2, 0.5)
                 await self.page.keyboard.press("Enter")
                 posted = True
 
-            await asyncio.sleep(2.5)
+            await self.human.pause(2.0, 4.0)
             await self.stats.increment("comments")
             logger.success(f"[{account}] تم نشر التعليق: {text}")
             return True
@@ -939,20 +1023,21 @@ class InstagramBot:
                     href = "https://www.instagram.com" + href
                 logger.info(f"[{account}] فتح منشور: {href}")
                 await self.page.goto(href, wait_until="domcontentloaded", timeout=45000)
-                await asyncio.sleep(2.5)
+                await self.human.pause(2.0, 4.5)
                 await self.dismiss_overlays()
+                await self.human.read_post()
 
                 await self.like_current(account)
-                await asyncio.sleep(1)
+                await self.human.between_actions()
                 if self.config.enable_commenting:
                     await self.comment_current(account)
-                    await asyncio.sleep(1)
+                    await self.human.between_actions()
                 if getattr(self.config, "enable_repost", True):
                     await self.repost_current(account)
-                    await asyncio.sleep(1)
+                    await self.human.between_actions()
                 await self.share_to_story(account)
                 opened += 1
-                await asyncio.sleep(2)
+                await self.human.between_posts()
             except Exception as e:
                 logger.warning(f"[{account}] خطأ منشور #{i}: {type(e).__name__}: {e}")
                 continue
@@ -999,9 +1084,11 @@ class InstagramBot:
         # احتفظ بالمسار فقط — إنستغرام يفتح /p/ و /reel/ للصور والفيديو
         logger.info(f"[{account}] فتح المنشور المستهدف: {url}")
         await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
-        await asyncio.sleep(3)
+        await self.human.pause(2.5, 5.0)
         await self.dismiss_overlays()
+        await self.human.move_around()
         await self.wait_for_post_ready(account, timeout_s=20)
+        await self.human.read_post()
 
         liked = False
         commented = False
@@ -1009,10 +1096,13 @@ class InstagramBot:
         story = False
         if self.config.enable_liking:
             liked = await self.like_current(account)
+            await self.human.between_actions()
         if self.config.enable_commenting:
             commented = await self.comment_current(account)
+            await self.human.between_actions()
         if getattr(self.config, "enable_repost", True):
             reposted = await self.repost_current(account)
+            await self.human.between_actions()
         if self.config.enable_sharing:
             story = await self.share_to_story(account)
 
@@ -1317,20 +1407,25 @@ class InstagramChecker:
 
         after_ts = time.time() - 2
         try:
-            await user_input.click(force=True)
+            human = Human(page)
+            await human.move_around()
+            await human.human_click(user_input)
+            await human.pause(0.3, 0.8)
             await user_input.fill("")
-            await user_input.type(login, delay=25)
-            await asyncio.sleep(0.4)
-            await pass_input.click(force=True)
+            await human.human_type(login)
+            await human.pause(0.4, 1.0)
+            await human.human_click(pass_input)
+            await human.pause(0.2, 0.6)
             await pass_input.fill("")
-            await pass_input.type(password, delay=25)
-            await asyncio.sleep(0.5)
+            await human.human_type(password)
+            await human.pause(0.5, 1.2)
         except Exception as e:
             logger.warning(f"[{login}] فشل تعبئة الفورم: {e}")
             await self.log_page_state(page, login, "fill-fail")
             return False
 
         submitted = False
+        human = Human(page)
         for sel in [
             'button[type="submit"]',
             'button:has-text("Log in")',
@@ -1339,21 +1434,16 @@ class InstagramChecker:
             btn = page.locator(sel).first
             try:
                 if await btn.count() > 0 and await btn.is_visible():
-                    await btn.click(timeout=5000)
+                    await human.human_click(btn)
                     submitted = True
                     break
             except Exception:
-                try:
-                    await btn.click(force=True)
-                    submitted = True
-                    break
-                except Exception:
-                    continue
+                continue
         if not submitted:
             await page.keyboard.press("Enter")
 
         logger.info(f"[{login}] تم ضغط Log in — انتظار...")
-        await asyncio.sleep(4)
+        await human.pause(3.0, 6.0)
 
         for _ in range(4):
             for sel in [
@@ -1541,6 +1631,8 @@ class AccountProcessor:
                 logger.info(f"[{idx + 1}/{len(self.accounts)}] فحص {account['email']}")
                 try:
                     await self.checker.check_account(account)
+                    # فاصل بشري بين الحسابات
+                    await asyncio.sleep(random.uniform(5.0, 14.0))
                     async with self.lock:
                         await self.stats.increment("processed")
                 except Exception as e:
