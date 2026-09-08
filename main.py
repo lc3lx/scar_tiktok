@@ -15,7 +15,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v5"
+BOT_VERSION = "2026-09-09-instagram-v6"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -212,7 +212,7 @@ def load_settings() -> dict:
         "dashboard_port": 5050,
         "proxy_enabled": False,
         "proxy": "",
-        "force_relogin": True,
+        "force_relogin": False,
     }
     if os.path.exists(SETTINGS_FILE):
         try:
@@ -244,7 +244,7 @@ class Config:
     max_check_attempts: int = 1
     proxy_enabled: bool = False
     proxy: str = ""
-    force_relogin: bool = True
+    force_relogin: bool = False
     page_timeout: int = 45
     action_delay: float = 1.0
     enable_commenting: bool = True
@@ -301,7 +301,7 @@ class Config:
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
         cfg.browser_headless = bool(s.get("browser_headless", True))
-        cfg.force_relogin = bool(s.get("force_relogin", True))
+        cfg.force_relogin = bool(s.get("force_relogin", False))
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = (s.get("imap_host") or "imap.hostinger.com").strip()
         cfg.imap_port = int(s.get("imap_port", 993) or 993)
@@ -1421,13 +1421,13 @@ class InstagramChecker:
                         if os.path.exists(session_file):
                             try:
                                 os.remove(session_file)
-                                logger.info(f"[{login}] حذف الجلسة القديمة")
+                                logger.info(f"[{login}] فرض إعادة دخول — تم حذف الجلسة القديمة")
                             except Exception:
                                 pass
                     elif os.path.exists(session_file):
                         context_kwargs["storage_state"] = session_file
                         use_session = True
-                        logger.info(f"[{login}] تحميل جلسة محفوظة")
+                        logger.info(f"[{login}] استخدام جلسة محفوظة (بدون login جديد)")
 
                     context = await browser.new_context(**context_kwargs)
                     context.set_default_timeout(self.config.page_timeout * 1000)
@@ -1438,11 +1438,12 @@ class InstagramChecker:
                     logged_in = False
                     if use_session:
                         await self.safe_goto(page, "https://www.instagram.com/", login)
+                        await asyncio.sleep(2)
                         logged_in = await self.is_logged_in(page)
                         if logged_in:
-                            logger.success(f"[{login}] الجلسة ما زالت صالحة")
+                            logger.success(f"[{login}] الجلسة صالحة — تخطي تسجيل الدخول")
                         else:
-                            logger.warning(f"[{login}] الجلسة منتهية")
+                            logger.warning(f"[{login}] الجلسة منتهية — سيتم login مرة واحدة ثم الحفظ")
 
                     if not logged_in:
                         lock = get_login_otp_lock() if self.config.auto_otp else None
@@ -1459,11 +1460,12 @@ class InstagramChecker:
                         await unregister_browser(browser)
                         return False
 
+                    # احفظ الجلسة فوراً بعد الدخول الناجح
                     try:
                         await context.storage_state(path=session_file)
-                        logger.info(f"[{login}] حفظ الجلسة")
-                    except Exception:
-                        pass
+                        logger.success(f"[{login}] تم حفظ الجلسة → {session_file}")
+                    except Exception as e:
+                        logger.warning(f"[{login}] تعذر حفظ الجلسة: {e}")
 
                     self.file_handler.save_account(login, password)
                     bot = InstagramBot(page, self.config, self.stats)
@@ -1481,6 +1483,13 @@ class InstagramChecker:
                     except Exception as e:
                         logger.error(f"[{login}] خطأ أثناء التفاعل: {type(e).__name__}: {e}")
                         await self.stats.increment("errors")
+
+                    # تحديث الجلسة بعد النشاط
+                    try:
+                        await context.storage_state(path=session_file)
+                        logger.info(f"[{login}] تحديث الجلسة المحفوظة")
+                    except Exception:
+                        pass
 
                     if ok:
                         await self.stats.increment("successful")
@@ -1586,6 +1595,7 @@ async def run_bot(config: Config = None) -> dict:
     logger.info(f"💬 تعليقات متبقية: {remaining_count()}")
     logger.info(f"👥 متصفحات متوازية: {config.max_browsers}")
     logger.info(f"📧 OTP تلقائي: {'نعم' if config.auto_otp else 'لا'}")
+    logger.info(f"🔑 إعادة دخول إجبارية: {'نعم' if config.force_relogin else 'لا (استخدام الجلسات)'}")
     logger.info("🛡️ البروكسي: ملغى")
     logger.info("=" * 60)
 

@@ -14,7 +14,7 @@
   "imap_port": 993,
   "otp_timeout": 90,
   "auto_otp": true,
-  "force_relogin": true,
+  "force_relogin": false,
   "dashboard_host": "0.0.0.0",
   "dashboard_port": 5050
 }

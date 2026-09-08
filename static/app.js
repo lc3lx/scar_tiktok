@@ -62,7 +62,7 @@ function fillSettings(s, comments) {
   document.getElementById("commentEnabled").checked = !!s.enable_commenting;
   document.getElementById("autoOtp").checked = s.auto_otp !== false;
   document.getElementById("headless").checked = s.browser_headless !== false;
-  document.getElementById("forceRelogin").checked = s.force_relogin !== false;
+  document.getElementById("forceRelogin").checked = !!s.force_relogin;
   document.getElementById("watchCount").value = s.watch_count ?? 0;
   document.getElementById("maxBrowsers").value = s.max_browsers || 1;
   document.getElementById("otpTimeout").value = s.otp_timeout || 90;
