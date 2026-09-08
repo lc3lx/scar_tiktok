@@ -15,7 +15,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v3"
+BOT_VERSION = "2026-09-09-instagram-v4"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -449,40 +449,113 @@ class InstagramBot:
         except Exception:
             pass
 
-    async def is_liked(self) -> bool:
-        for sel in [
-            'svg[aria-label="Unlike"]',
-            'svg[aria-label="Remove Like"]',
-            '[aria-label="Unlike"]',
-        ]:
-            try:
-                loc = self.page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    return True
-            except Exception:
-                continue
+    async def wait_for_post_ready(self, account: str, timeout_s: int = 20) -> bool:
+        """ينتظر ظهور منشور صورة أو فيديو/ريل."""
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            await self.dismiss_overlays()
+            ready = await self.page.evaluate(
+                """() => {
+                    const hasMedia = !!(
+                      document.querySelector('article video, article img, main video, main img[srcset], div[role="dialog"] video, div[role="dialog"] img')
+                    );
+                    const hasActions = !!(
+                      document.querySelector('svg[aria-label="Like"], svg[aria-label="Unlike"], svg[aria-label="Comment"], svg[aria-label="Share"], svg[aria-label="Share Post"]')
+                    );
+                    return {hasMedia, hasActions, url: location.href};
+                }"""
+            )
+            if ready.get("hasMedia") or ready.get("hasActions"):
+                logger.info(
+                    f"[{account}] المنشور جاهز (media={ready.get('hasMedia')} actions={ready.get('hasActions')})"
+                )
+                return True
+            await asyncio.sleep(1)
+        logger.warning(f"[{account}] المنشور لم يكتمل تحميله | URL={self.page.url}")
         return False
+
+    async def dump_action_dom(self, account: str, tag: str) -> None:
+        try:
+            info = await self.page.evaluate(
+                """() => {
+                    const labels = Array.from(document.querySelectorAll('[aria-label]'))
+                      .slice(0, 40)
+                      .map(e => e.getAttribute('aria-label'));
+                    const areas = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
+                      .slice(0, 10)
+                      .map(e => ({
+                        tag: e.tagName,
+                        aria: e.getAttribute('aria-label'),
+                        ph: e.getAttribute('placeholder'),
+                        visible: !!(e.offsetParent || e.getClientRects().length)
+                      }));
+                    return {
+                      url: location.href,
+                      labels: [...new Set(labels)],
+                      inputs: areas,
+                      hasVideo: !!document.querySelector('video'),
+                      hasImg: !!document.querySelector('article img, main img'),
+                      body: (document.body?.innerText||'').replace(/\\s+/g,' ').slice(0,350)
+                    };
+                }"""
+            )
+            logger.warning(f"[{account}] {tag}: {info}")
+            # #region agent log
+            _dbg("ACT", "main.py:dump_action_dom", tag, {"account": account, "info": info})
+            # #endregion
+        except Exception as e:
+            logger.warning(f"[{account}] {tag} dump failed: {e}")
+
+    async def is_liked(self) -> bool:
+        liked = await self.page.evaluate(
+            """() => {
+                const sels = [
+                  'svg[aria-label="Unlike"]',
+                  'svg[aria-label="Remove Like"]',
+                  '[aria-label="Unlike"]',
+                  '[aria-label="Remove Like"]',
+                ];
+                for (const s of sels) {
+                  const el = document.querySelector(s);
+                  if (el) {
+                    const r = el.getBoundingClientRect();
+                    if (r.width > 0 && r.height > 0) return true;
+                  }
+                }
+                // أحياناً الزر أحمر بدون Unlike واضح — مسار بديل
+                const path = document.querySelector('span svg[aria-label="Unlike"], section svg[aria-label="Unlike"]');
+                return !!path;
+            }"""
+        )
+        return bool(liked)
 
     async def like_current(self, account: str) -> bool:
         if not self.config.enable_liking:
             return False
         await self.dismiss_overlays()
+        await self.wait_for_post_ready(account, timeout_s=12)
+
         if await self.is_liked():
             logger.info(f"[{account}] اللايك موجود مسبقاً — تخطي")
             return True
+
+        # 1) نقر أزرار Like الشائعة (صورة أو فيديو)
         for sel in [
+            'main button:has(svg[aria-label="Like"])',
+            'article button:has(svg[aria-label="Like"])',
+            'div[role="dialog"] button:has(svg[aria-label="Like"])',
+            'section button:has(svg[aria-label="Like"])',
+            'button:has(svg[aria-label="Like"])',
             'svg[aria-label="Like"]',
             '[aria-label="Like"]',
-            'button:has(svg[aria-label="Like"])',
         ]:
             try:
                 loc = self.page.locator(sel).first
-                if await loc.count() == 0 or not await loc.is_visible():
+                if await loc.count() == 0:
                     continue
-                # click button parent when svg
-                btn = self.page.locator('button:has(svg[aria-label="Like"])').first
-                target = btn if await btn.count() > 0 else loc
-                await target.click(force=True, timeout=4000)
+                if not await loc.is_visible():
+                    continue
+                await loc.click(force=True, timeout=4000)
                 await asyncio.sleep(1.2)
                 if await self.is_liked():
                     await self.stats.increment("likes")
@@ -490,6 +563,50 @@ class InstagramBot:
                     return True
             except Exception:
                 continue
+
+        # 2) JS click على أول Like ظاهر
+        try:
+            clicked = await self.page.evaluate(
+                """() => {
+                    const nodes = Array.from(document.querySelectorAll('svg[aria-label="Like"], [aria-label="Like"]'));
+                    const el = nodes.find(n => {
+                      const r = n.getBoundingClientRect();
+                      return r.width > 0 && r.height > 0;
+                    });
+                    if (!el) return false;
+                    const btn = el.closest('button,div[role="button"],span') || el;
+                    btn.click();
+                    return true;
+                }"""
+            )
+            await asyncio.sleep(1.2)
+            if clicked and await self.is_liked():
+                await self.stats.increment("likes")
+                logger.success(f"[{account}] تم عمل لايك (JS)")
+                return True
+        except Exception:
+            pass
+
+        # 3) double-click على الصورة/الفيديو
+        try:
+            media = self.page.locator(
+                'article video, article img, main video, div[role="dialog"] video, div[role="dialog"] img'
+            ).first
+            if await media.count() > 0 and await media.is_visible():
+                box = await media.bounding_box()
+                if box:
+                    x = box["x"] + box["width"] / 2
+                    y = box["y"] + box["height"] / 2
+                    await self.page.mouse.dblclick(x, y)
+                    await asyncio.sleep(1.5)
+                    if await self.is_liked():
+                        await self.stats.increment("likes")
+                        logger.success(f"[{account}] تم عمل لايك (double-click على الوسائط)")
+                        return True
+        except Exception:
+            pass
+
+        await self.dump_action_dom(account, "like-fail")
         logger.warning(f"[{account}] تعذر عمل لايك")
         return False
 
@@ -503,44 +620,76 @@ class InstagramBot:
             return False
 
         await self.dismiss_overlays()
-        # focus comment box
-        box = None
-        for sel in [
-            'textarea[aria-label*="Add a comment" i]',
-            'textarea[placeholder*="Add a comment" i]',
-            'textarea[aria-label*="comment" i]',
-            'form textarea',
-            'div[contenteditable="true"][aria-label*="comment" i]',
-            'div[role="textbox"]',
-        ]:
-            try:
-                loc = self.page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    box = loc
-                    break
-            except Exception:
-                continue
+        await self.wait_for_post_ready(account, timeout_s=10)
 
-        if not box:
-            # open comments if needed
-            try:
-                cbtn = self.page.locator('svg[aria-label="Comment"], button:has(svg[aria-label="Comment"])').first
-                if await cbtn.count() > 0:
-                    await cbtn.click(force=True)
-                    await asyncio.sleep(1.5)
-            except Exception:
-                pass
-            for sel in [
+        async def find_box():
+            sels = [
                 'textarea[aria-label*="Add a comment" i]',
                 'textarea[placeholder*="Add a comment" i]',
+                'textarea[aria-label*="comment" i]',
+                'textarea[placeholder*="comment" i]',
                 'form textarea',
+                'div[contenteditable="true"][aria-label*="comment" i]',
+                'div[contenteditable="true"][role="textbox"]',
+                'p[contenteditable="true"]',
+                '[role="textbox"]',
+            ]
+            for sel in sels:
+                try:
+                    loc = self.page.locator(sel)
+                    n = await loc.count()
+                    for i in range(min(n, 5)):
+                        item = loc.nth(i)
+                        if await item.is_visible():
+                            return item
+                except Exception:
+                    continue
+            return None
+
+        box = await find_box()
+        if not box:
+            # افتح أيقونة التعليق (مهم للريل/الفيديو)
+            for sel in [
+                'button:has(svg[aria-label="Comment"])',
+                'svg[aria-label="Comment"]',
+                '[aria-label="Comment"]',
             ]:
-                loc = self.page.locator(sel).first
-                if await loc.count() > 0 and await loc.is_visible():
-                    box = loc
-                    break
+                try:
+                    cbtn = self.page.locator(sel).first
+                    if await cbtn.count() > 0 and await cbtn.is_visible():
+                        await cbtn.click(force=True)
+                        await asyncio.sleep(1.8)
+                        break
+                except Exception:
+                    continue
+            box = await find_box()
 
         if not box:
+            # JS: ركّز أي textbox ظاهر
+            try:
+                focused = await self.page.evaluate(
+                    """() => {
+                        const eds = Array.from(document.querySelectorAll(
+                          'textarea, [contenteditable="true"], [role="textbox"]'
+                        ));
+                        const el = eds.find(e => {
+                          const r = e.getBoundingClientRect();
+                          return r.width > 40 && r.height > 10;
+                        });
+                        if (!el) return false;
+                        el.focus();
+                        el.click();
+                        return true;
+                    }"""
+                )
+                if focused:
+                    await asyncio.sleep(0.5)
+                    box = await find_box()
+            except Exception:
+                pass
+
+        if not box:
+            await self.dump_action_dom(account, "comment-fail")
             logger.error(f"[{account}] لم يجد حقل التعليق")
             return False
 
@@ -548,21 +697,30 @@ class InstagramBot:
             await box.click(force=True)
             await asyncio.sleep(0.3)
             try:
+                await box.fill("")
                 await box.fill(text)
             except Exception:
-                await self.page.keyboard.type(text, delay=30)
-            await asyncio.sleep(0.5)
+                try:
+                    await box.type(text, delay=35)
+                except Exception:
+                    await self.page.keyboard.type(text, delay=35)
+            await asyncio.sleep(0.6)
 
             posted = False
             for sel in [
+                'form div[role="button"]:has-text("Post")',
                 'div[role="button"]:has-text("Post")',
                 'button:has-text("Post")',
                 'div[role="button"]:has-text("Publish")',
                 'button:has-text("Publish")',
+                '[role="button"]:has-text("Post")',
             ]:
                 btn = self.page.locator(sel).first
                 try:
                     if await btn.count() > 0 and await btn.is_visible():
+                        disabled = await btn.get_attribute("aria-disabled")
+                        if disabled == "true":
+                            continue
                         await btn.click(force=True)
                         posted = True
                         break
@@ -570,13 +728,15 @@ class InstagramBot:
                     continue
             if not posted:
                 await self.page.keyboard.press("Enter")
+                posted = True
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(2.5)
             await self.stats.increment("comments")
             logger.success(f"[{account}] تم نشر التعليق: {text}")
             return True
         except Exception as e:
             logger.warning(f"[{account}] فشل التعليق: {type(e).__name__}: {e}")
+            await self.dump_action_dom(account, "comment-exception")
             return False
 
     async def share_to_story(self, account: str) -> bool:
@@ -586,17 +746,13 @@ class InstagramBot:
         await self.dismiss_overlays()
         try:
             share_btn = self.page.locator(
-                'svg[aria-label="Share Post"], svg[aria-label="Share"], '
-                'button:has(svg[aria-label="Share Post"]), button:has(svg[aria-label="Share"])'
+                'button:has(svg[aria-label="Share Post"]), button:has(svg[aria-label="Share"]), '
+                'svg[aria-label="Share Post"], svg[aria-label="Share"]'
             ).first
             if await share_btn.count() == 0 or not await share_btn.is_visible():
                 logger.warning(f"[{account}] زر الشير غير ظاهر")
                 return False
-            btn = self.page.locator(
-                'button:has(svg[aria-label="Share Post"]), button:has(svg[aria-label="Share"])'
-            ).first
-            target = btn if await btn.count() > 0 else share_btn
-            await target.click(force=True)
+            await share_btn.click(force=True)
             await asyncio.sleep(1.5)
 
             for sel in [
@@ -610,7 +766,6 @@ class InstagramBot:
                 if await opt.count() > 0 and await opt.is_visible():
                     await opt.click(force=True)
                     await asyncio.sleep(2)
-                    # confirm share if needed
                     for conf in [
                         'button:has-text("Share")',
                         'div[role="button"]:has-text("Share")',
@@ -628,23 +783,13 @@ class InstagramBot:
                     await self.dismiss_overlays()
                     return True
 
-            # fallback: copy link counts as share action log
-            for sel in [
-                'button:has-text("Copy link")',
-                'span:has-text("Copy link")',
-            ]:
-                opt = self.page.locator(sel).first
-                if await opt.count() > 0 and await opt.is_visible():
-                    await opt.click(force=True)
-                    await self.stats.increment("shares")
-                    logger.info(f"[{account}] Add to story غير متاح على الويب — تم Copy link كبديل")
-                    await self.dismiss_overlays()
-                    return True
-
+            # Copy link ليس نجاح ستوري — أغلق القائمة فقط
+            try:
+                await self.page.keyboard.press("Escape")
+            except Exception:
+                pass
             await self.dismiss_overlays()
-            # close share sheet
-            await self.page.keyboard.press("Escape")
-            logger.warning(f"[{account}] لم تتوفر خيار Add to story على الويب")
+            logger.warning(f"[{account}] Add to story غير متاح على الويب")
             return False
         except Exception as e:
             logger.warning(f"[{account}] فشل الشير/ستوري: {type(e).__name__}: {e}")
@@ -753,18 +898,27 @@ class InstagramBot:
         if not url:
             logger.error(f"[{account}] رابط الفيديو/الريل فارغ")
             return False
+        # احتفظ بالمسار فقط — إنستغرام يفتح /p/ و /reel/ للصور والفيديو
         logger.info(f"[{account}] فتح المنشور المستهدف: {url}")
         await self.page.goto(url, wait_until="domcontentloaded", timeout=45000)
         await asyncio.sleep(3)
         await self.dismiss_overlays()
+        await self.wait_for_post_ready(account, timeout_s=20)
 
-        ok = False
+        liked = False
+        commented = False
+        story = False
         if self.config.enable_liking:
-            ok = await self.like_current(account) or ok
+            liked = await self.like_current(account)
         if self.config.enable_commenting:
-            ok = await self.comment_current(account) or ok
+            commented = await self.comment_current(account)
         if self.config.enable_sharing:
-            ok = await self.share_to_story(account) or ok
+            story = await self.share_to_story(account)
+
+        ok = liked or commented or story
+        logger.info(
+            f"[{account}] نتيجة المنشور: like={liked} comment={commented} story={story}"
+        )
         return ok
 
 
