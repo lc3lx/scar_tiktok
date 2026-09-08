@@ -16,7 +16,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v8"
+BOT_VERSION = "2026-09-09-instagram-v9"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -330,14 +330,13 @@ class Config:
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
         cfg.browser_headless = bool(s.get("browser_headless", True))
-        # دائماً: بدون بروكسي وبدون إجبار login (استخدم الجلسات)
-        cfg.force_relogin = False
+        cfg.proxy_enabled = bool(s.get("proxy_enabled", False))
+        cfg.proxy = (s.get("proxy") or "").strip()
+        cfg.force_relogin = bool(s.get("force_relogin", False))
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = (s.get("imap_host") or "imap.hostinger.com").strip()
         cfg.imap_port = int(s.get("imap_port", 993) or 993)
         cfg.otp_timeout = int(s.get("otp_timeout", 90) or 90)
-        cfg.proxy_enabled = False
-        cfg.proxy = ""
         return cfg
 
 
@@ -1751,20 +1750,15 @@ async def run_bot(config: Config = None) -> dict:
     if config is None:
         config = Config.from_settings()
 
-    # البروكسي ملغى — تجاهل أي إعداد أو متغير بيئة قديم
-    config.proxy_enabled = False
-    config.proxy = ""
-    config.force_relogin = False
-    # ثبّت على القرص حتى لا تبقى الواجهة القديمة تفرض login كل مرة
-    try:
-        s = load_settings()
-        if s.get("force_relogin") or s.get("proxy_enabled"):
-            s["force_relogin"] = False
-            s["proxy_enabled"] = False
-            s["proxy"] = ""
-            save_settings(s)
-    except Exception:
-        pass
+    env_proxy = (
+        os.environ.get("IG_PROXY")
+        or os.environ.get("PROXY")
+        or os.environ.get("TIKTOK_PROXY")
+        or ""
+    ).strip()
+    if env_proxy:
+        config.proxy = env_proxy
+        config.proxy_enabled = True
 
     migrate_from_settings(config.comment_texts)
 
@@ -1783,7 +1777,12 @@ async def run_bot(config: Config = None) -> dict:
     logger.info(f"👥 متصفحات متوازية: {config.max_browsers}")
     logger.info(f"📧 OTP تلقائي: {'نعم' if config.auto_otp else 'لا'}")
     logger.info(f"🔑 إعادة دخول إجبارية: {'نعم' if config.force_relogin else 'لا (استخدام الجلسات)'}")
-    logger.info("🛡️ البروكسي: ملغى")
+    if config.proxy_enabled and config.proxy:
+        parsed = parse_proxy(config.proxy)
+        server = (parsed or {}).get("server", config.proxy)
+        logger.info(f"🛡️ البروكسي: مفعّل → {server}")
+    else:
+        logger.warning("🛡️ البروكسي: معطّل — إنستغرام غالباً يحظر IP السيرفر")
     logger.info("=" * 60)
 
     accounts = read_accounts(config)

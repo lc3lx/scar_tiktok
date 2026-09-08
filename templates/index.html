@@ -58,8 +58,13 @@
           <label class="check"><input type="checkbox" id="commentEnabled" checked /> تعليق (من المجمع)</label>
           <label class="check"><input type="checkbox" id="autoOtp" checked /> OTP تلقائي</label>
           <label class="check"><input type="checkbox" id="headless" checked /> Headless (VPS)</label>
+          <label class="check"><input type="checkbox" id="proxyEnabled" /> تفعيل البروكسي</label>
           <label class="check"><input type="checkbox" id="forceRelogin" /> إجبار login جديد (امسح الجلسة)</label>
         </div>
+
+        <label>البروكسي (host:port:user:pass)</label>
+        <input id="proxy" type="text" placeholder="host:port:user:pass أو http://user:pass@host:port" autocomplete="off" />
+        <p class="hint">يفضّل بروكسي سكني (residential) — IP السيرفر غالباً محظور من إنستغرام</p>
 
         <div class="row two">
           <div>
