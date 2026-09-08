@@ -16,7 +16,7 @@ from playwright_stealth import Stealth
 from email_otp import wait_for_otp, mark_otp_used
 from comments_pool import take_comment, remaining_count, migrate_from_settings, peek_status
 
-BOT_VERSION = "2026-09-09-instagram-v7"
+BOT_VERSION = "2026-09-09-instagram-v8"
 
 # #region agent log
 _DEBUG_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "debug-8e9bfe.log")
@@ -120,9 +120,15 @@ def parse_proxy(raw: str) -> Optional[Dict[str, str]]:
 
 
 async def launch_browser(playwright, config: "Config"):
+    args = list(config.browser_args)
+    # headless الجديد أقل انكشافاً من القديم
+    if config.browser_headless:
+        args = [a for a in args if not a.startswith("--headless")]
+        args.append("--headless=new")
+
     kwargs = {
         "headless": config.browser_headless,
-        "args": list(config.browser_args),
+        "args": args,
     }
     if getattr(config, "proxy_enabled", False) and getattr(config, "proxy", ""):
         proxy_cfg = parse_proxy(config.proxy)
@@ -150,6 +156,21 @@ async def launch_browser(playwright, config: "Config"):
             browser = await playwright.chromium.launch(**kwargs)
     ACTIVE_BROWSERS.append(browser)
     return browser
+
+
+async def prepare_page(page: Page) -> None:
+    """إخفاء علامات الأتمتة قدر الإمكان."""
+    try:
+        await page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = window.chrome || { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            """
+        )
+    except Exception:
+        pass
 
 
 SETTINGS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "settings.json")
@@ -309,12 +330,12 @@ class Config:
         cfg.watch_count = int(s.get("watch_count", 3) or 3)
         cfg.max_browsers = max(1, int(s.get("max_browsers", 1) or 1))
         cfg.browser_headless = bool(s.get("browser_headless", True))
-        cfg.force_relogin = bool(s.get("force_relogin", False))
+        # دائماً: بدون بروكسي وبدون إجبار login (استخدم الجلسات)
+        cfg.force_relogin = False
         cfg.auto_otp = bool(s.get("auto_otp", True))
         cfg.imap_host = (s.get("imap_host") or "imap.hostinger.com").strip()
         cfg.imap_port = int(s.get("imap_port", 993) or 993)
         cfg.otp_timeout = int(s.get("otp_timeout", 90) or 90)
-        # البروكسي ملغى نهائياً
         cfg.proxy_enabled = False
         cfg.proxy = ""
         return cfg
@@ -1288,15 +1309,69 @@ class InstagramChecker:
             except Exception:
                 continue
 
-    async def wait_for_login_form(self, page: Page, account: str, timeout_s: int = 35):
+    async def page_looks_blank(self, page: Page) -> bool:
+        try:
+            info = await page.evaluate(
+                """() => ({
+                    textLen: (document.body?.innerText || '').trim().length,
+                    inputs: document.querySelectorAll('input').length,
+                    buttons: document.querySelectorAll('button').length,
+                    ready: document.readyState
+                })"""
+            )
+            return (info.get("textLen", 0) < 20 and info.get("inputs", 0) == 0)
+        except Exception:
+            return True
+
+    async def recover_blank_login_page(self, page: Page, account: str) -> bool:
+        """محاولات إنقاذ عندما إنستغرام يرجع صفحة فارغة على VPS."""
+        logger.error(
+            f"[{account}] صفحة إنستغرام فارغة (غالباً حظر IP السيرفر أو headless). جاري المحاولة..."
+        )
+        for i, url in enumerate([
+            "https://www.instagram.com/",
+            "https://www.instagram.com/accounts/login/",
+            "https://www.instagram.com/accounts/login/?hl=en",
+        ]):
+            try:
+                await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            except Exception as e:
+                logger.warning(f"[{account}] تنقل #{i}: {e}")
+            await asyncio.sleep(4 + i * 2)
+            await self.dismiss_cookie_banners(page)
+            # انتظر أي input يظهر
+            try:
+                await page.wait_for_selector(
+                    'input[name="username"], input[name="password"], input[type="text"]',
+                    timeout=12000,
+                )
+            except Exception:
+                pass
+            if not await self.page_looks_blank(page):
+                logger.info(f"[{account}] الصفحة صارت تحتوي محتوى بعد المحاولة #{i+1}")
+                return True
+        await self.log_page_state(page, account, "blank-page-unrecoverable")
+        logger.error(
+            f"[{account}] إنستغرام ما زال يعرض صفحة فارغة من هذا السيرفر. "
+            f"الحل: بروكسي سكني نظيف، أو شغّل المتصفح بواجهة (xvfb + headless=false)، "
+            f"أو سجّل الدخول مرة من جهاز عادي واحفظ الجلسة."
+        )
+        return False
+
+    async def wait_for_login_form(self, page: Page, account: str, timeout_s: int = 50):
         """ينتظر ظهور حقول الدخول مع عدة محاولات تنقل."""
+        if await self.page_looks_blank(page):
+            await self.recover_blank_login_page(page, account)
+
         deadline = time.time() + timeout_s
         attempt = 0
         while time.time() < deadline:
             attempt += 1
             await self.dismiss_cookie_banners(page)
 
-            # روابط Log in على الصفحة الرئيسية
+            if await self.page_looks_blank(page) and attempt in (2, 5):
+                await self.recover_blank_login_page(page, account)
+
             for sel in [
                 'a[href="/accounts/login/"]',
                 'a[href*="/accounts/login"]',
@@ -1306,7 +1381,6 @@ class InstagramChecker:
                 try:
                     a = page.locator(sel).first
                     if await a.count() > 0 and await a.is_visible():
-                        # لا تضغط إذا الحقول ظاهرة أصلاً
                         if await page.locator('input[name="username"]').count() == 0:
                             await a.click(force=True)
                             await asyncio.sleep(2)
@@ -1319,6 +1393,7 @@ class InstagramChecker:
                 'input[aria-label*="username" i]',
                 'input[placeholder*="username" i]',
                 'input[autocomplete="username"]',
+                'input[type="text"]',
             ]
             pass_sels = [
                 'input[name="password"]',
@@ -1351,11 +1426,10 @@ class InstagramChecker:
             if await self.is_logged_in(page):
                 return None, None
 
-            # صفحات حظر / خطأ شائعة
             try:
                 body = (await page.inner_text("body"))[:800].lower()
                 if any(x in body for x in ("sorry, this page", "something went wrong", "try again later", "unavailable")):
-                    logger.error(f"[{account}] صفحة خطأ/حظر من إنستغرام — غالباً البروكسي")
+                    logger.error(f"[{account}] صفحة خطأ/حظر من إنستغرام")
                     await self.log_page_state(page, account, "ig-blocked")
                     return None, None
             except Exception:
@@ -1363,20 +1437,24 @@ class InstagramChecker:
 
             if attempt in (1, 3, 6):
                 logger.info(f"[{account}] انتظار فورم الدخول... URL={page.url}")
-                # إعادة فتح صفحة الدخول
                 try:
                     await page.goto(
-                        "https://www.instagram.com/accounts/login/?source=auth_switcher",
+                        "https://www.instagram.com/accounts/login/?hl=en",
                         wait_until="domcontentloaded",
-                        timeout=45000,
+                        timeout=60000,
                     )
                 except Exception:
                     pass
-                await asyncio.sleep(2)
+                await asyncio.sleep(3)
 
             await asyncio.sleep(1.5)
 
         await self.log_page_state(page, account, "login-form-timeout")
+        if await self.page_looks_blank(page):
+            logger.error(
+                f"[{account}] السبب الجذري: صفحة فارغة من إنستغرام على IP السيرفر — "
+                f"مو مشكلة يوزر/باسورد"
+            )
         return None, None
 
     async def login(self, page: Page, account: Dict) -> bool:
@@ -1390,15 +1468,20 @@ class InstagramChecker:
         await self.dismiss_cookie_banners(page)
         await asyncio.sleep(2)
 
+        if await self.page_looks_blank(page):
+            ok = await self.recover_blank_login_page(page, login)
+            if not ok:
+                return False
+
         if await self.is_logged_in(page):
             logger.success(f"[{login}] مسجّل مسبقاً")
             return True
 
-        await self.safe_goto(page, "https://www.instagram.com/accounts/login/", login)
-        await asyncio.sleep(2)
+        await self.safe_goto(page, "https://www.instagram.com/accounts/login/?hl=en", login)
+        await asyncio.sleep(3)
         await self.dismiss_cookie_banners(page)
 
-        user_input, pass_input = await self.wait_for_login_form(page, login, timeout_s=40)
+        user_input, pass_input = await self.wait_for_login_form(page, login, timeout_s=55)
         if user_input is None and pass_input is None:
             if await self.is_logged_in(page):
                 return True
@@ -1522,6 +1605,7 @@ class InstagramChecker:
                     context = await browser.new_context(**context_kwargs)
                     context.set_default_timeout(self.config.page_timeout * 1000)
                     page = await context.new_page()
+                    await prepare_page(page)
                     stealth = Stealth()
                     await stealth.apply_stealth_async(page)
 
@@ -1670,6 +1754,17 @@ async def run_bot(config: Config = None) -> dict:
     # البروكسي ملغى — تجاهل أي إعداد أو متغير بيئة قديم
     config.proxy_enabled = False
     config.proxy = ""
+    config.force_relogin = False
+    # ثبّت على القرص حتى لا تبقى الواجهة القديمة تفرض login كل مرة
+    try:
+        s = load_settings()
+        if s.get("force_relogin") or s.get("proxy_enabled"):
+            s["force_relogin"] = False
+            s["proxy_enabled"] = False
+            s["proxy"] = ""
+            save_settings(s)
+    except Exception:
+        pass
 
     migrate_from_settings(config.comment_texts)
 
